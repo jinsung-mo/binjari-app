@@ -1,0 +1,58 @@
+name: parking_app_0413
+description: A smart parking application for university campus.
+publish_to: 'none' # Remove this line if you wish to publish to pub.dev
+version: 1.0.0+1
+
+environment:
+  sdk: '>=2.19.0 <3.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.2
+  http: ^0.13.5
+  shared_preferences: ^2.1.0
+  intl: ^0.18.0
+  google_maps_flutter: 2.5.0
+  google_maps_flutter_web: 0.5.12
+  geolocator: ^9.0.2
+  geocoding: ^2.1.0
+  provider: ^6.0.5
+  fl_chart: ^0.62.0
+  url_launcher: ^6.1.10
+  flutter_launcher_icons: ^0.13.1
+  flutter_native_splash: ^2.3.8
+
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^2.0.0
+
+flutter:
+  assets:
+    - assets/icons/app_icon.png
+    - assets/icons/splash_image.png
+  uses-material-design: true
+
+flutter_launcher_icons:
+  android: "ic_launcher"  # 안드로이드 아이콘 이름 지정
+  ios: true
+  image_path: "assets/icons/app_icon.png"  # 정확한 경로 확인
+  adaptive_icon_background: "#0F54A1"  # 배경색 (창원대학교 파란색)
+  adaptive_icon_foreground: "assets/icons/app_icon.png"  # 전경 이미지로 동일한 이미지 사용
+  remove_alpha_ios: true  # iOS에서 투명도 제거
+  web:
+    generate: false  # 웹 아이콘 생성 비활성화
+  windows:
+    generate: false  # Windows 아이콘 생성 비활성화
+  macos:
+    generate: false  # macOS 아이콘 생성 비활성화
+
+flutter_native_splash:
+  color: "#0F54A1"  # 원하는 파란색 배경 색상
+  image: "assets/icons/splash_image.png"  # 로고 이미지
+  android: true
+  ios: true
+  android_12:
+    image: "assets/icons/splash_image.png"

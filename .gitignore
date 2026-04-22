@@ -1,0 +1,21 @@
+# General
+.DS_Store
+._*
+*.log
+*.db
+*.iml
+.idea/
+.metadata
+
+# Large Files
+models/*.pt
+videos/parking_best.mp4
+
+# Flutter/Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+build/
+
