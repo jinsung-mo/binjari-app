@@ -6,21 +6,37 @@ class AppConfig {
   //static String baseUrl = 'http://10.0.2.2:5000'; // Android 에뮬레이터용
   // static String baseUrl = 'http://localhost:5000';  // iOS 시뮬레이터용
   // static String baseUrl = 'http://127.0.0.1:5000'; // 로컬 테스트용
-  static String baseUrl = 'http://10.100.142.97:5000'; // 특정 IP 서버용
+  // 빌드 시 --dart-define=API_BASE_URL=http://서버IP:5000 으로 지정할 수 있고,
+  // 관리자 화면에서 저장한 서버 주소가 있으면 앱 시작 시 그 값으로 바뀜
+  static String baseUrl = const String.fromEnvironment(
+    'API_BASE_URL',
+    defaultValue: 'http://10.100.142.97:5000', // 특정 IP 서버용
+  );
 
-  // API 엔드포인트
-  static String statusEndpoint = '$baseUrl/api/status';
-  static String statisticsEndpoint = '$baseUrl/api/statistics';
-  static String historyEndpoint = '$baseUrl/api/history';
-  static String startSystemEndpoint = '$baseUrl/api/start';
-  static String stopSystemEndpoint = '$baseUrl/api/stop';
-  static String debugEndpoint = '$baseUrl/api/debug';
-  static String parkingLotsEndpoint = '$baseUrl/api/parking_lots';
-  static String dynamicParkingLotsEndpoint = '$baseUrl/api/parking_lots/dynamic'; // 동적 추가
-  static String uploadCoordinatesEndpoint = '$baseUrl/api/parking_lots'; // 좌표 업로드
+  // 관리자 API 토큰 (관리자 인증 후 메모리에만 보관, 서버 요청 시 X-Admin-Token 헤더로 전송)
+  static String? adminToken;
 
-  // Google Maps API 키
-  static String googleMapsApiKey = 'AIzaSyBqClpv6rBxd0zPxDkk-HuJFGERzNbsQAU';
+  // API 엔드포인트 (baseUrl 변경이 바로 반영되도록 getter로 계산)
+  static String get healthEndpoint => '$baseUrl/api/health';
+  static String get authCheckEndpoint => '$baseUrl/api/auth/check';
+  static String get statusEndpoint => '$baseUrl/api/status';
+  static String get statisticsEndpoint => '$baseUrl/api/statistics';
+  static String get historyEndpoint => '$baseUrl/api/history';
+  static String get startSystemEndpoint => '$baseUrl/api/start';
+  static String get stopSystemEndpoint => '$baseUrl/api/stop';
+  static String get debugEndpoint => '$baseUrl/api/debug';
+  static String get parkingLotsEndpoint => '$baseUrl/api/parking_lots';
+  static String get dynamicParkingLotsEndpoint => '$baseUrl/api/parking_lots/dynamic'; // 동적 추가
+  static String get uploadCoordinatesEndpoint => '$baseUrl/api/parking_lots'; // 좌표 업로드
+
+  // JSON 요청 헤더 (관리자 인증 후에는 토큰 포함)
+  static Map<String, String> get jsonHeaders => {
+        'Content-Type': 'application/json',
+        if (adminToken != null) 'X-Admin-Token': adminToken!,
+      };
+
+  // Google Maps API 키는 소스에 두지 않음
+  // Android: android/local.properties 의 MAPS_API_KEY, iOS/Web: 각 플랫폼 설정 파일에서 지정
 
   // 앱 테마 색상
   static const primaryColorHex = 0xFF1976D2; // 파란색 계열
@@ -67,18 +83,18 @@ class AppConfig {
       'building': '중앙도서관',
       'latitude': 35.245288,
       'longitude': 128.690894,
-      'capacity': 37, // A1-A12 (12개) + B1-B10 (10개) + C1-C8 (8개) + D1-D7 (7개)
+      'capacity': 36, // A1-A12 (12개) + B1-B10 (10개) + C1-C8 (8개) + D1-D6 (6개)
       'type': 'outdoor',
       'hasDisabledSpaces': true,
       'openHours': '06:00 - 23:00',
       'description': '중앙도서관 옆에 위치한 주차장으로, 전기차 및 장애인 전용 주차 공간을 포함합니다.',
       'hasVideo': true,
       'status': 'active',
-      'videoWidth': 1170,
-      'videoHeight': 694,
+      'videoWidth': 1216,
+      'videoHeight': 720,
       'specialSpaces': {
         'electric': ['D4electric', 'D5electric'], // 전기차 전용
-        'disabled': ['D6disabled', 'D7disabled'], // 장애인 전용
+        'disabled': ['D6disabled'], // 장애인 전용
       }
     },
     'parking_lot_C': {
@@ -151,8 +167,8 @@ class AppConfig {
     },
     'parking_lot_B': {
       'hasVideo': true,
-      'width': 1170,
-      'height': 694,
+      'width': 1216,
+      'height': 720,
       'streamUrl': '/api/stream/parking_lot_B',
     },
     'parking_lot_C': {
@@ -218,8 +234,11 @@ class AppConfig {
     'parking_lot_D', // 53호관 (영상 없음)
   ];
 
+  // 지도에 추가로 표시할 주차 가능 건물 (id -> name, latitude, longitude, description)
+  static const Map<String, Map<String, dynamic>> additionalBuildings = {};
+
   // 동적 주차장 관리를 위한 메소드들
-  static Map<String, dynamic> _dynamicParkingLots = {};
+  static final Map<String, Map<String, dynamic>> _dynamicParkingLots = {};
 
   // 동적으로 주차장 추가
   static void addDynamicParkingLot(String id, Map<String, dynamic> lotData) {
@@ -338,11 +357,74 @@ class AppConfig {
       errors['videoSource'] = '비디오 파일 경로는 필수입니다';
     }
 
-    // 좌표 데이터 검증
-    if (lotData['coordinates'] == null ||
-        (lotData['coordinates'] as List).isEmpty) {
-      errors['coordinates'] = '주차 공간 좌표 데이터는 필수입니다';
+    // 주차면 좌표는 추가 후 좌표 파일 업로드로 설정할 수 있으므로 필수가 아님
+
+    return errors;
+  }
+
+  // 주차장 이름 (동적 주차장 포함, 없으면 ID 그대로)
+  static String getParkingLotName(String parkingLotId) {
+    final info = getParkingLotInfo(parkingLotId);
+    return info?['name']?.toString() ?? parkingLotNames[parkingLotId] ?? parkingLotId;
+  }
+
+  // 등록된 주차장인지 확인
+  static bool isValidParkingLot(String parkingLotId) {
+    return getAllParkingLots().containsKey(parkingLotId);
+  }
+
+  // 영상(실시간 분석)이 연결된 주차장인지 확인
+  static bool hasVideoStream(String parkingLotId) {
+    return getParkingLotInfo(parkingLotId)?['hasVideo'] == true;
+  }
+
+  // 주차장 영상 스트림 URL (MJPEG)
+  static String getStreamEndpoint(String parkingLotId) {
+    final streamPath = videoInfo[parkingLotId]?['streamUrl'] ?? '/api/stream/$parkingLotId';
+    return '$baseUrl$streamPath';
+  }
+
+  // 주차 이력 조회 URL
+  static String getHistoryEndpoint({String? parkingLotId, int days = 7}) {
+    final params = <String, String>{
+      'days': '$days',
+      if (parkingLotId != null) 'parking_lot': parkingLotId,
+    };
+    return Uri.parse(historyEndpoint).replace(queryParameters: params).toString();
+  }
+
+  // 주차장 기본 설정 검증 (필드명 -> 오류 메시지)
+  static Map<String, String> validateParkingLotConfig(Map<String, dynamic> lotData) {
+    final Map<String, String> errors = {};
+
+    final id = lotData['id']?.toString() ?? '';
+    if (id.isEmpty) {
+      errors['id'] = '주차장 ID는 필수입니다';
+    } else if (!RegExp(r'^[A-Za-z0-9_-]{1,64}$').hasMatch(id)) {
+      errors['id'] = '주차장 ID는 영문, 숫자, _, - 로 이루어진 64자 이하여야 합니다';
+    }
+
+    if ((lotData['name']?.toString() ?? '').trim().isEmpty) {
+      errors['name'] = '주차장 이름은 필수입니다';
+    }
+    if ((lotData['building']?.toString() ?? '').trim().isEmpty) {
+      errors['building'] = '건물명은 필수입니다';
+    }
+
+    final latitude = lotData['latitude'];
+    if (latitude is! num || latitude < -90 || latitude > 90) {
+      errors['latitude'] = '위도는 -90 ~ 90 사이의 숫자여야 합니다';
+    }
+    final longitude = lotData['longitude'];
+    if (longitude is! num || longitude < -180 || longitude > 180) {
+      errors['longitude'] = '경도는 -180 ~ 180 사이의 숫자여야 합니다';
+    }
+
+    final capacity = lotData['capacity'];
+    if (capacity is! int || capacity <= 0) {
+      errors['capacity'] = '주차 가능 대수는 1 이상의 정수여야 합니다';
     }
 
     return errors;
   }
+}

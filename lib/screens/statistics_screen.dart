@@ -4,9 +4,6 @@ import 'package:intl/intl.dart';
 import '../config/app_config.dart';
 import '../models/parking_model.dart';
 import '../services/parking_service.dart';
-import '../utils/platform_util.dart';
-import '../widgets/common_widgets.dart';
-import 'dart:math' as math;
 
 class StatisticsScreen extends StatefulWidget {
   final String? initialParkingLotId; // 특정 주차장 초기 선택
@@ -341,8 +338,8 @@ class _StatisticsScreenState extends State<StatisticsScreen> with SingleTickerPr
               TextField(
                 controller: videoPathController,
                 decoration: const InputDecoration(
-                  labelText: '비디오 파일 경로',
-                  hintText: 'C:\\Videos\\parking.mp4',
+                  labelText: '영상 소스',
+                  hintText: '서버 videos 폴더의 파일명 또는 rtsp:// 주소',
                 ),
               ),
               const SizedBox(height: 16),
@@ -420,6 +417,16 @@ class _StatisticsScreenState extends State<StatisticsScreen> with SingleTickerPr
 
   // 새 주차장 추가 실행
   Future<void> _addNewParkingLot(String name, String building, String videoPath) async {
+    if (AppConfig.adminToken == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('주차장 추가는 관리자 인증이 필요합니다. 관리자 화면에서 먼저 인증하세요.'),
+          backgroundColor: Colors.orange,
+        ),
+      );
+      return;
+    }
+
     try {
       // 임시 ID 생성
       final newId = 'parking_lot_${DateTime.now().millisecondsSinceEpoch}';
@@ -783,6 +790,7 @@ class _StatisticsScreenState extends State<StatisticsScreen> with SingleTickerPr
               _buildLegendItem('높은 점유율 (>80%)', Colors.red),
               _buildLegendItem('보통 점유율 (>50%)', Colors.orange),
               _buildLegendItem('낮은 점유율 (<50%)', Colors.green),
+              _buildLegendItem('기록 없음', Colors.grey.shade300),
               if (_selectedParkingLot == 'parking_lot_B') ...[
                 _buildLegendItem('전기차 전용', Colors.yellow[700]!),
                 _buildLegendItem('장애인 전용', Colors.blue[700]!),
@@ -1082,8 +1090,21 @@ class _StatisticsScreenState extends State<StatisticsScreen> with SingleTickerPr
     );
   }
 
+  // 데이터 출처 표시 문구
+  String _sourceLabel(HourlyData data) {
+    switch (data.source) {
+      case 'live':
+        return '실시간';
+      case 'today':
+        return '오늘 평균';
+      case 'week':
+        return '최근 7일 평균';
+      default:
+        return '데이터 없음';
+    }
+  }
+
   Widget _buildHourlyDataTable(ParkingStatistics statistics) {
-    // 기존 구현과 동일하지만 주차장별 특별 정보 표시 추가
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1094,14 +1115,42 @@ class _StatisticsScreenState extends State<StatisticsScreen> with SingleTickerPr
             fontWeight: FontWeight.bold,
           ),
         ),
-        const SizedBox(height: 16),
-        // 기존 시간별 데이터 테이블 구현
+        const SizedBox(height: 8),
+        Text(
+          '서버가 5분 간격으로 기록한 점유율의 시간대별 평균입니다. 기록이 없는 시간대는 비워 둡니다.',
+          style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+        ),
+        const SizedBox(height: 8),
+        Card(
+          child: Column(
+            children: statistics.hourlyData.map((data) {
+              return ListTile(
+                dense: true,
+                leading: Icon(
+                  data.isCurrent ? Icons.access_time_filled : Icons.access_time,
+                  color: data.isCurrent ? Colors.blue : Colors.grey,
+                ),
+                title: Text(
+                  data.formattedTime,
+                  style: TextStyle(fontWeight: data.isCurrent ? FontWeight.bold : FontWeight.normal),
+                ),
+                subtitle: Text(_sourceLabel(data)),
+                trailing: Text(
+                  data.hasData ? data.formattedRate : '-',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: data.hasData ? _getOccupancyColor(data.occupancyRate) : Colors.grey,
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+        ),
       ],
     );
   }
 
   Widget _buildRecommendationTab() {
-    // 기존 구현과 동일
     if (_selectedParkingLot == null) {
       return _buildNoParkingLotSelected();
     }
@@ -1111,12 +1160,84 @@ class _StatisticsScreenState extends State<StatisticsScreen> with SingleTickerPr
       return _buildNoDataAvailable();
     }
 
-    // 기존 추천 탭 구현
-    return Container(); // 실제 구현 필요
+    final recommendation = statistics.recommendation;
+
+    // 향후 12시간 중 데이터가 있는 시간대 (점유율 낮은 순)
+    final currentHour = statistics.current.hour;
+    final upcoming = List.generate(12, (i) => (currentHour + i + 1) % 24)
+        .map((hour) => statistics.getHourData(hour))
+        .whereType<HourlyData>()
+        .where((data) => data.hasData)
+        .toList()
+      ..sort((a, b) => a.occupancyRate.compareTo(b.occupancyRate));
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16.0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildSelectedParkingLotHeader(),
+          const SizedBox(height: 16),
+          Card(
+            color: recommendation.hasData ? Colors.green.shade50 : Colors.grey.shade100,
+            child: Padding(
+              padding: const EdgeInsets.all(20.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    '추천 주차 시간 (향후 12시간)',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 12),
+                  if (recommendation.hasData) ...[
+                    Text(
+                      recommendation.formattedTime,
+                      style: const TextStyle(fontSize: 36, fontWeight: FontWeight.bold, color: Colors.green),
+                    ),
+                    const SizedBox(height: 4),
+                    Text('예상 점유율 ${recommendation.formattedRate}'),
+                  ] else
+                    const Text('아직 누적된 주차 기록이 부족해 추천할 수 없습니다. '
+                        '서버가 실행되는 동안 5분마다 점유율이 기록됩니다.'),
+                ],
+              ),
+            ),
+          ),
+          if (upcoming.isNotEmpty) ...[
+            const SizedBox(height: 24),
+            const Text(
+              '여유로운 시간대 순위',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            Card(
+              child: Column(
+                children: upcoming.take(5).toList().asMap().entries.map((entry) {
+                  final data = entry.value;
+                  return ListTile(
+                    leading: CircleAvatar(
+                      radius: 14,
+                      backgroundColor: _getOccupancyColor(data.occupancyRate),
+                      child: Text('${entry.key + 1}', style: const TextStyle(color: Colors.white, fontSize: 12)),
+                    ),
+                    title: Text(data.formattedTime),
+                    subtitle: Text(_sourceLabel(data)),
+                    trailing: Text(
+                      data.formattedRate,
+                      style: TextStyle(fontWeight: FontWeight.bold, color: _getOccupancyColor(data.occupancyRate)),
+                    ),
+                  );
+                }).toList(),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
   }
 
   Widget _buildSummaryTab() {
-    // 기존 구현과 동일
     if (_selectedParkingLot == null) {
       return _buildNoParkingLotSelected();
     }
@@ -1126,8 +1247,97 @@ class _StatisticsScreenState extends State<StatisticsScreen> with SingleTickerPr
       return _buildNoDataAvailable();
     }
 
-    // 기존 요약 탭 구현
-    return Container(); // 실제 구현 필요
+    final current = statistics.current;
+    final withData = statistics.hourlyData.where((data) => data.hasData).toList();
+    HourlyData? busiest;
+    for (final data in withData) {
+      if (busiest == null || data.occupancyRate > busiest.occupancyRate) busiest = data;
+    }
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16.0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildSelectedParkingLotHeader(),
+          const SizedBox(height: 16),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    current.isLive ? '현재 상태 (${current.time}, 실시간)' : '현재 상태 (${current.time})',
+                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceAround,
+                    children: [
+                      _buildSummaryValue('전체', '${current.totalSpaces}', Colors.grey.shade700),
+                      _buildSummaryValue('주차 중', '${current.occupiedSpaces}', Colors.red),
+                      _buildSummaryValue('주차 가능', '${current.availableSpaces}', Colors.green),
+                      _buildSummaryValue('점유율', current.formattedRate, _getOccupancyColor(current.occupancyRate)),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          const Text(
+            '시간대별 평균 점유율',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          Card(
+            child: Column(
+              children: statistics.timePeriods.values.map((period) {
+                return ListTile(
+                  title: Text(period.label),
+                  trailing: Text(
+                    period.hasData ? period.formattedRate : '데이터 없음',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: period.hasData ? _getOccupancyColor(period.avgRate) : Colors.grey,
+                    ),
+                  ),
+                );
+              }).toList(),
+            ),
+          ),
+          const SizedBox(height: 16),
+          Card(
+            child: Column(
+              children: [
+                ListTile(
+                  leading: const Icon(Icons.bar_chart),
+                  title: const Text('기록이 있는 시간대'),
+                  trailing: Text('${withData.length} / 24'),
+                ),
+                if (busiest != null)
+                  ListTile(
+                    leading: const Icon(Icons.warning_amber, color: Colors.red),
+                    title: const Text('가장 혼잡한 시간대'),
+                    trailing: Text('${busiest.formattedTime} (${busiest.formattedRate})'),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSummaryValue(String label, String value, Color color) {
+    return Column(
+      children: [
+        Text(value, style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: color)),
+        const SizedBox(height: 4),
+        Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+      ],
+    );
   }
 
   Widget _buildLegendItem(String label, Color color) {
@@ -1175,6 +1385,14 @@ class BarChartPainter extends CustomPainter {
 
     for (int i = 0; i < data.length; i++) {
       final hourData = data[i];
+
+      // 기록이 없는 시간대는 바닥에 회색 표시만 남김
+      if (!hourData.hasData) {
+        paint.color = Colors.grey.shade300;
+        canvas.drawRect(Rect.fromLTWH(i * barWidth + 20, size.height - 2, barWidth * 0.8, 2), paint);
+        continue;
+      }
+
       final barHeight = (hourData.occupancyRate / 100) * size.height;
 
       Color barColor;

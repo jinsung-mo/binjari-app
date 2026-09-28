@@ -4,7 +4,6 @@
 import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 
-import '../config/app_config.dart';
 import '../models/parking_lot_config_model.dart';
 import '../services/parking_lot_config_service.dart';
 import '../utils/platform_util.dart';

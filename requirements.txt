@@ -1,0 +1,7 @@
+# 빈자리 분석 서버 (app_v1.py, detect.py) 의존성
+flask>=2.2
+flask-cors>=3.0
+ultralytics>=8.0
+opencv-python>=4.7  # 서버/헤드리스 환경에서는 opencv-python-headless 사용 후 --no-video 옵션으로 실행
+numpy>=1.23
+pillow>=9.0

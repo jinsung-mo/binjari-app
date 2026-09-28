@@ -19,3 +19,8 @@ videos/parking_best.mp4
 .pub/
 build/
 
+
+# Server runtime files
+models/
+test_video_*.avi
+detect_result.mp4

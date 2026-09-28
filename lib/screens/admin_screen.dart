@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../config/app_config.dart';
@@ -7,11 +6,9 @@ import '../services/parking_service.dart';
 import '../services/admin_settings_service.dart';
 import '../models/admin_settings_model.dart';
 import '../utils/platform_util.dart';
-import '../widgets/common_widgets.dart';
 import 'parking_lots_admin_screen.dart';
 
 // 플랫폼별 임포트
-import 'package:flutter/foundation.dart' show kIsWeb;
 
 // 조건부 임포트 (Windows에서도 작동하도록)
 // 실제 사용 시에는 이 패키지들이 필요합니다
@@ -89,12 +86,16 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
     }
   }
 
-  // 시스템 상태 확인
+  // 시스템 상태 확인 (서버 헬스체크의 running 값 사용)
   Future<void> _checkSystemStatus() async {
     try {
-      // 향후 서버 API 연결 시 실제 상태를 가져오도록 수정
+      final health = await _parkingService.getServerHealth();
+      if (!mounted) return;
       setState(() {
-        _isSystemRunning = true;
+        _isSystemRunning = health?['running'] == true;
+        if (health == null) {
+          _errorMessage = '서버에 연결할 수 없습니다 (${AppConfig.baseUrl})';
+        }
       });
     } catch (e) {
       setState(() {
@@ -103,8 +104,29 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
     }
   }
 
+  // 관리자 인증 확인. 토큰이 없으면 입력 다이얼로그를 띄워 서버에서 검증한다.
+  Future<bool> _ensureAdmin() async {
+    if (AppConfig.adminToken != null) return true;
+
+    final token = await _showPasswordDialog();
+    if (token == null || token.isEmpty) return false;
+
+    try {
+      final verified = await _parkingService.verifyAdminToken(token);
+      if (!verified) {
+        _showSnackBar('관리자 토큰이 올바르지 않습니다', isError: true);
+      }
+      return verified;
+    } catch (e) {
+      _showSnackBar('관리자 인증 중 오류가 발생했습니다: $e', isError: true);
+      return false;
+    }
+  }
+
   // 시스템 시작
   Future<void> _startSystem() async {
+    if (!await _ensureAdmin()) return;
+
     try {
       setState(() {
         _isLoading = true;
@@ -134,6 +156,8 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
 
   // 시스템 중지
   Future<void> _stopSystem() async {
+    if (!await _ensureAdmin()) return;
+
     try {
       setState(() {
         _isLoading = true;
@@ -278,39 +302,37 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
     */
   }
 
-  // 설정 저장
+  // 설정 저장. 새 서버 주소에서 관리자 토큰이 확인되어야 저장된다.
   Future<void> _saveSettings() async {
+    if (_isPasswordDialogOpen) return;
+
+    final newApiUrl = _apiUrlController.text.trim().replaceAll(RegExp(r'/+$'), '');
+    if (Uri.tryParse(newApiUrl)?.hasScheme != true) {
+      _showSnackBar('API 서버 주소는 http://IP:포트 형식이어야 합니다', isError: true);
+      return;
+    }
+
+    // 새 주소의 서버에서 인증하도록 주소를 먼저 바꾸고, 실패하면 되돌림
+    final previousApiUrl = AppConfig.baseUrl;
+    final previousToken = AppConfig.adminToken;
+    AppConfig.baseUrl = newApiUrl;
+    if (newApiUrl != previousApiUrl) {
+      AppConfig.adminToken = null;
+    }
+
+    if (!await _ensureAdmin()) {
+      AppConfig.baseUrl = previousApiUrl;
+      AppConfig.adminToken = previousToken;
+      return;
+    }
+
     try {
       setState(() {
         _isLoading = true;
       });
 
-      // 패스워드 확인
-      if (_isPasswordDialogOpen) return;
-
-      // 비밀번호 확인 다이얼로그 표시
-      _showPasswordDialog();
-    } catch (e) {
-      setState(() {
-        _errorMessage = '설정 저장 중 오류가 발생했습니다: $e';
-        _isLoading = false;
-      });
-      _showSnackBar('설정 저장 중 오류가 발생했습니다: $e', isError: true);
-    }
-  }
-
-  // 실제 설정 저장 구현
-  Future<void> _saveSettingsWithPassword(String password) async {
-    try {
-      // 비밀번호 검증 (실제로는 서버에서 해야 함)
-      if (password != '1234') {
-        _showSnackBar('잘못된 비밀번호입니다', isError: true);
-        return;
-      }
-
-      // 설정 업데이트
       final updatedSettings = AdminSettings(
-        apiUrl: _apiUrlController.text,
+        apiUrl: newApiUrl,
         modelPath: _modelPathController.text,
         videoPath: _videoPathController.text,
         lastUpdated: DateTime.now(),
@@ -324,6 +346,7 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
       });
 
       _showSnackBar('설정이 성공적으로 저장되었습니다');
+      _checkSystemStatus();
     } catch (e) {
       setState(() {
         _errorMessage = '설정 저장 중 오류가 발생했습니다: $e';
@@ -353,14 +376,14 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
     }
   }
 
-  // 비밀번호 확인 다이얼로그
-  void _showPasswordDialog() {
+  // 관리자 토큰 입력 다이얼로그 (취소 시 null)
+  Future<String?> _showPasswordDialog() async {
     setState(() {
       _isPasswordDialogOpen = true;
       _passwordController.text = '';
     });
 
-    showDialog(
+    final token = await showDialog<String>(
       context: context,
       barrierDismissible: false,
       builder: (context) {
@@ -369,12 +392,12 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Text('설정을 변경하려면 관리자 비밀번호를 입력하세요'),
+              const Text('서버의 관리자 토큰(ADMIN_TOKEN)을 입력하세요'),
               const SizedBox(height: 16),
               TextField(
                 controller: _passwordController,
                 decoration: const InputDecoration(
-                  labelText: '비밀번호',
+                  labelText: '관리자 토큰',
                   border: OutlineInputBorder(),
                 ),
                 obscureText: true,
@@ -383,32 +406,26 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
           ),
           actions: [
             TextButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-                setState(() {
-                  _isPasswordDialogOpen = false;
-                  _isLoading = false;
-                });
-              },
+              onPressed: () => Navigator.of(context).pop(),
               child: const Text('취소'),
             ),
             ElevatedButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-                setState(() {
-                  _isPasswordDialogOpen = false;
-                });
-                _saveSettingsWithPassword(_passwordController.text);
-              },
+              onPressed: () => Navigator.of(context).pop(_passwordController.text.trim()),
               child: const Text('확인'),
             ),
           ],
         );
       },
     );
+
+    if (mounted) {
+      setState(() {
+        _isPasswordDialogOpen = false;
+      });
+    }
+    return token;
   }
 
-  // 텍스트 입력 다이얼로그 (Windows 등 파일 선택기 미지원 플랫폼용)
   void _showTextInputDialog(String title, String message, TextEditingController controller) {
     final TextEditingController tempController = TextEditingController(text: controller.text);
 

@@ -26,30 +26,17 @@ class ParkingStatus {
     return parkingLots.values.fold(0, (sum, lot) => sum + lot.totalSpaces);
   }
 
-  // 장애인 주차 가능 공간 수 (ID가 'C'로 시작하거나 'disabled'를 포함하는 빈 공간)
+  // 장애인 주차 가능 공간 수 (ID에 'disabled'가 포함된 빈 공간)
   int get disabledAvailableSpaces {
-    int count = 0;
-    parkingLots.values.forEach((lot) {
-      lot.spaces.forEach((space) {
-        if ((space.id.startsWith('C') || space.id.contains('disabled')) && space.status == 'empty') {
-          count++;
-        }
-      });
-    });
-    return count;
+    return parkingLots.values
+        .expand((lot) => lot.spaces)
+        .where((space) => space.isDisabledSpace && space.isEmpty)
+        .length;
   }
 
-  // 전체 장애인 주차 공간 수도 함께 수정
+  // 전체 장애인 주차 공간 수
   int get totalDisabledSpaces {
-    int count = 0;
-    parkingLots.values.forEach((lot) {
-      lot.spaces.forEach((space) {
-        if (space.id.startsWith('C') || space.id.contains('disabled')) {
-          count++;
-        }
-      });
-    });
-    return count;
+    return parkingLots.values.expand((lot) => lot.spaces).where((space) => space.isDisabledSpace).length;
   }
 
   // 전체 주차장 점유율
@@ -138,7 +125,7 @@ class ParkingSpace {
 
   // 장애인 주차 공간 여부 - 수정 버전
   bool get isDisabledSpace {
-    return section == 'C' || id.contains("disabled");
+    return id.toLowerCase().contains('disabled');
   }
 }
 
@@ -200,7 +187,8 @@ class ParkingStatistics {
     }
 
     // 추천 정보 처리
-    final recommendation = Recommendation.fromJson(json['recommendation'] ?? {});
+    // 데이터가 부족하면 서버가 null을 보냄 -> hasData == false
+    final recommendation = Recommendation.fromJson(json['recommendation']);
 
     // 시간대별 정보 처리
     final Map<String, TimePeriod> timePeriods = {};
@@ -256,6 +244,7 @@ class CurrentStatus {
   final int totalSpaces;
   final int occupiedSpaces;
   final int availableSpaces;
+  final bool isLive; // 실시간 분석 결과인지 여부
 
   CurrentStatus({
     required this.time,
@@ -265,6 +254,7 @@ class CurrentStatus {
     required this.totalSpaces,
     required this.occupiedSpaces,
     required this.availableSpaces,
+    this.isLive = false,
   });
 
   factory CurrentStatus.fromJson(Map<String, dynamic> json) {
@@ -276,6 +266,7 @@ class CurrentStatus {
       totalSpaces: json['total_spaces'] ?? 0,
       occupiedSpaces: json['occupied_spaces'] ?? 0,
       availableSpaces: json['available_spaces'] ?? 0,
+      isLive: json['is_live'] ?? false,
     );
   }
 }
@@ -287,6 +278,8 @@ class HourlyData {
   final double occupancyRate;
   final String formattedRate;
   final bool isCurrent;
+  final bool hasData; // 해당 시간대에 누적된 측정값이 있는지 여부
+  final String? source; // live: 실시간, today: 당일 평균, week: 최근 7일 평균
 
   HourlyData({
     required this.hour,
@@ -294,6 +287,8 @@ class HourlyData {
     required this.occupancyRate,
     required this.formattedRate,
     required this.isCurrent,
+    this.hasData = true,
+    this.source,
   });
 
   factory HourlyData.fromJson(Map<String, dynamic> json) {
@@ -301,8 +296,10 @@ class HourlyData {
       hour: json['hour'] ?? 0,
       formattedTime: json['formatted_time'] ?? '00:00',
       occupancyRate: (json['occupancy_rate'] ?? 0).toDouble(),
-      formattedRate: json['formatted_rate'] ?? '0%',
+      formattedRate: json['formatted_rate'] ?? '-',
       isCurrent: json['is_current'] ?? false,
+      hasData: json['has_data'] ?? true,
+      source: json['source'],
     );
   }
 }
@@ -313,17 +310,33 @@ class Recommendation {
   final String formattedTime;
   final double occupancyRate;
   final String formattedRate;
+  final bool hasData; // 추천할 만큼 누적된 데이터가 있는지 여부
 
   Recommendation({
     required this.bestHour,
     required this.formattedTime,
     required this.occupancyRate,
     required this.formattedRate,
+    this.hasData = true,
   });
 
-  factory Recommendation.fromJson(Map<String, dynamic> json) {
+  // 데이터가 부족해 추천할 수 없는 상태
+  factory Recommendation.none() {
     return Recommendation(
-      bestHour: json['best_hour'] ?? 0,
+      bestHour: 0,
+      formattedTime: '-',
+      occupancyRate: 0.0,
+      formattedRate: '-',
+      hasData: false,
+    );
+  }
+
+  factory Recommendation.fromJson(Map<String, dynamic>? json) {
+    if (json == null || json['best_hour'] == null) {
+      return Recommendation.none();
+    }
+    return Recommendation(
+      bestHour: json['best_hour'],
       formattedTime: json['formatted_time'] ?? '00:00',
       occupancyRate: (json['occupancy_rate'] ?? 0).toDouble(),
       formattedRate: json['formatted_rate'] ?? '0%',
@@ -336,18 +349,21 @@ class TimePeriod {
   final String label;
   final double avgRate;
   final String formattedRate;
+  final bool hasData;
 
   TimePeriod({
     required this.label,
     required this.avgRate,
     required this.formattedRate,
+    this.hasData = true,
   });
 
   factory TimePeriod.fromJson(Map<String, dynamic> json) {
     return TimePeriod(
       label: json['label'] ?? '',
       avgRate: (json['avg_rate'] ?? 0).toDouble(),
-      formattedRate: json['formatted_rate'] ?? '0%',
+      formattedRate: json['formatted_rate'] ?? '-',
+      hasData: json['has_data'] ?? true,
     );
   }
 }

@@ -89,9 +89,9 @@ class ConnectivityHelper {
     }
 
     try {
-      // 디버그 엔드포인트로 빠른 확인
+      // 헬스체크 엔드포인트로 빠른 확인
       final response = await http.get(
-        Uri.parse(AppConfig.debugEndpoint),
+        Uri.parse(AppConfig.healthEndpoint),
       ).timeout(const Duration(seconds: 5));
 
       bool previousState = _isServerAvailable;

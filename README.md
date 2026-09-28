@@ -43,7 +43,31 @@
 - Database: SQLite
 - Communication: REST API (CORS 지원)
 
-## 5. 기대 효과
+## 5. 실행 방법
+
+### 분석 서버 (Python 3.9+)
+```bash
+pip install -r requirements.txt
+# 학습된 가중치(space-empty / space-occupied 2클래스)를 models/best.pt 에 두거나 MODEL_PATH로 지정
+export ADMIN_TOKEN=원하는-관리자-토큰   # 미지정 시 시작할 때 임시 토큰을 생성해 로그에 출력
+python app_v1.py                       # 영상 창 없이 실행: python app_v1.py --no-video
+```
+- 영상: `videos/library2.mp4`(도서관)는 저장소에 포함되어 있고, 55호관 영상은 `videos/parking_best.mp4`에 두거나 `VIDEO_PATH_A`로 지정합니다. 영상이 없으면 테스트 영상을 생성합니다.
+- 주요 옵션: `--frame-skip 5`(5프레임 중 1프레임 추론, 기본값), `--port 5000`
+- 환경 변수: `MODEL_PATH`, `VIDEO_PATH_A`, `VIDEO_PATH_B`, `VIDEOS_DIR`, `DB_PATH`, `ADMIN_TOKEN`, `FONT_PATH`
+- 시작/중지, 주차장 추가·수정·삭제, 좌표 업로드, 디버그 API는 `X-Admin-Token` 헤더가 필요합니다. 앱에서는 관리자 화면에서 토큰을 입력합니다.
+
+### 앱 (Flutter 3.27+)
+```bash
+flutter pub get
+flutter run --dart-define=API_BASE_URL=http://서버IP:5000
+```
+- Google Maps API 키는 저장소에 포함하지 않습니다.
+  - Android: `android/local.properties`에 `MAPS_API_KEY=...`
+  - iOS: `ios/Flutter/Secrets.xcconfig`에 `MAPS_API_KEY=...`
+- 서버 주소는 관리자 화면에서 변경·저장할 수도 있습니다.
+
+## 6. 기대 효과
 
 - 효율적인 시간 관리: 주차 소요 시간 단축을 통해 일상 속 생산성 향상
 - 스트레스 감소: 빈자리 탐색으로 인한 심리적 불안감 및 짜증 해소

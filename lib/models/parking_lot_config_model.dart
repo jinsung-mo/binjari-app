@@ -2,7 +2,6 @@
 // 주차장 설정 관련 데이터 모델
 
 import 'dart:convert';
-import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 
 class ParkingLotConfig {

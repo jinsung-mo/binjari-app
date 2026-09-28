@@ -1,20 +1,38 @@
+"""
+영상 파일에 YOLO 탐지 결과를 그려 새 영상으로 저장하는 단독 스크립트
+
+사용 예:
+    python detect.py --model models/best.pt --video videos/library2.mp4 --output library_detect.mp4
+"""
+import argparse
+import os
+import sys
+
 import cv2
 from ultralytics import YOLO
-import os
 
-# 경로 설정
-model_path = r"C:\Users\user\Desktop\Flutter\final.pt"
-video_path = r"C:\Users\user\Desktop\Flutter\parking_best.mp4"
-output_path = r"C:\Users\user\Desktop\Flutter\library_detect.mp4"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+parser = argparse.ArgumentParser(description='영상 YOLO 탐지 결과 저장')
+parser.add_argument('--model', default=os.getenv('MODEL_PATH', os.path.join(BASE_DIR, 'models', 'best.pt')),
+                    help='YOLO 가중치 경로 (기본: models/best.pt 또는 MODEL_PATH 환경 변수)')
+parser.add_argument('--video', default=os.path.join(BASE_DIR, 'videos', 'library2.mp4'), help='입력 영상 경로')
+parser.add_argument('--output', default='detect_result.mp4', help='결과 영상 저장 경로')
+parser.add_argument('--play', action='store_true', help='저장 후 결과 영상 재생')
+args = parser.parse_args()
+
+model_path = args.model
+video_path = args.video
+output_path = args.output
 
 # 파일 존재 확인
 if not os.path.exists(model_path):
     print(f"모델 파일을 찾을 수 없습니다: {model_path}")
-    exit()
+    sys.exit(1)
 
 if not os.path.exists(video_path):
     print(f"동영상 파일을 찾을 수 없습니다: {video_path}")
-    exit()
+    sys.exit(1)
 
 # YOLO 모델 로드
 print("YOLO 모델을 로드하는 중...")
@@ -58,7 +76,7 @@ while True:
 
     # 진행률 표시
     if frame_count % 30 == 0:
-        progress = (frame_count / total_frames) * 100
+        progress = (frame_count / total_frames) * 100 if total_frames > 0 else 0
         print(f"진행률: {progress:.1f}% ({frame_count}/{total_frames})")
 
 # 리소스 해제
@@ -69,8 +87,7 @@ cv2.destroyAllWindows()
 print(f"\nDetection 완료! 결과 동영상이 저장되었습니다: {output_path}")
 
 # 선택사항: 결과 동영상 재생
-play_result = input("\n결과 동영상을 바로 재생하시겠습니까? (y/n): ")
-if play_result.lower() == 'y':
+if args.play:
     cap_result = cv2.VideoCapture(output_path)
 
     print("\n동영상을 재생합니다. 'q'를 눌러 종료하세요.")

@@ -2,7 +2,6 @@
 // 오류 처리 및 서버 연결 문제 해결 화면
 
 import 'package:flutter/material.dart';
-import '../config/app_config.dart';
 import '../services/parking_service.dart';
 import '../utils/connectivity_helper.dart';
 
