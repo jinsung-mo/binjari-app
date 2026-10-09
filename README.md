@@ -14,6 +14,12 @@
 
 위 이미지는 저장소의 [`videos/library2.mp4`](videos/library2.mp4)에서 추출한 **원본 프레임**입니다. 차량 탐지 박스나 주차면별 점유 판정은 포함하지 않습니다. 추론 결과를 재현하려면 이 영상과 학습된 YOLO 가중치(`models/best.pt` 또는 `MODEL_PATH`)가 모두 필요합니다.
 
+### 영상 처리 화면 모의 시연
+
+[![모의 시연 영상 미리보기: 실제 YOLO 추론 결과가 아님](docs/media/simulated-parking-demo.png)](docs/media/simulated-parking-demo.mp4)
+
+이미지를 누르면 **6초짜리 MP4 모의 시연**을 볼 수 있습니다. 저장소의 실제 주차장 영상 위에 예시 빈자리·점유 박스를 **수동으로 지정**하고 스캔 효과를 더했습니다. 영상 안에도 `SIMULATED DEMO | NOT YOLO INFERENCE`를 표시했습니다. **모델 가중치가 없어 YOLO 추론을 실행한 결과가 아니며**, 탐지 정확도나 실제 주차면 판정 성능의 근거로 사용하지 않습니다. 생성 코드는 [`scripts/generate_mock_demo.swift`](scripts/generate_mock_demo.swift)에 있습니다.
+
 ## 프로젝트를 만든 이유
 
 교내 주차는 운전자가 주차 가능 여부를 현장에서 확인해야 하므로 여러 구역을 직접 이동하며 빈자리를 찾게 됩니다. 이 프로젝트는 다음 문제를 해결하는 것을 목표로 합니다.
