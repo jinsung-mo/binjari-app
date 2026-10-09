@@ -28,22 +28,7 @@
 
 ## 시스템 아키텍처
 
-```mermaid
-flowchart LR
-    V[주차장 영상] --> CV[OpenCV 프레임 처리]
-    CV --> Y[YOLOv8 탐지]
-    Y --> M[주차면 다각형 매핑]
-    M --> F[시간 필터 · 상태 머신]
-    F --> DB[(SQLite)]
-    F --> API[Flask REST API]
-    API --> APP[Flutter 앱]
-    API --> STREAM[MJPEG 스트림]
-    APP --> MAP[지도 · 상세 화면]
-    APP --> STAT[통계 화면]
-    ADMIN[관리자 화면] --> API
-```
-
-![BINJARI 시스템 구성도](docs/images/system-architecture.png)
+![BINJARI 시스템 아키텍처: 영상 입력부터 Flutter 앱까지의 데이터 흐름](docs/images/system-architecture.svg)
 
 분석 서버는 영상 입력·추론·주차면 판정·기록 저장을 맡고, Flutter 앱은 API를 통해 현황과 통계를 조회합니다. 영상 파일로 실행할 수 있으며, 주차면 좌표와 영상 소스는 관리자 기능에서 설정합니다.
 

@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1300" height="720" viewBox="0 0 1300 720" role="img" aria-labelledby="title description">
+  <title id="title">BINJARI 시스템 아키텍처</title>
+  <desc id="description">주차장 영상이 OpenCV 프레임 처리, YOLOv8 탐지, 주차면 매핑, 시간 필터와 상태 머신을 거쳐 SQLite에 저장되고 Flask API를 통해 Flutter 앱에 전달되는 흐름</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F7FBFF"/>
+      <stop offset="1" stop-color="#EFF5FF"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-35%" width="140%" height="180%">
+      <feDropShadow dx="0" dy="5" stdDeviation="8" flood-color="#263755" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow-blue" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M1 1L7 4.5L1 8" fill="none" stroke="#4385DC" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M1 1L7 4.5L1 8" fill="none" stroke="#21A77C" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M1 1L7 4.5L1 8" fill="none" stroke="#D99427" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <rect width="1300" height="720" rx="28" fill="url(#background)"/>
+  <circle cx="1200" cy="37" r="160" fill="#D9E9FF" opacity="0.35"/>
+  <circle cx="70" cy="700" r="150" fill="#DCF8F0" opacity="0.48"/>
+
+  <g font-family="Pretendard, Apple SD Gothic Neo, Noto Sans KR, Arial, sans-serif">
+    <rect x="44" y="35" width="231" height="27" rx="13.5" fill="#E2EDFF"/>
+    <text x="60" y="54" font-size="14" font-weight="700" letter-spacing="1.2" fill="#2563A9">BINJARI  /  SYSTEM DESIGN</text>
+    <text x="44" y="111" font-size="34" font-weight="800" fill="#17243B">영상에서 주차 안내까지</text>
+    <text x="45" y="141" font-size="17" fill="#607189">주차면 상태를 계산하고, 기록하고, 운전자에게 전달하는 데이터 흐름</text>
+    <rect x="1017" y="73" width="238" height="37" rx="18.5" fill="#FFFFFF" stroke="#D6E3F6"/>
+    <circle cx="1039" cy="91.5" r="5" fill="#2686D4"/>
+    <text x="1055" y="98" font-size="16" font-weight="700" fill="#305477">2개 주차장 · 56개 주차면</text>
+
+    <!-- Three clearly separated domains -->
+    <rect x="44" y="175" width="211" height="470" rx="24" fill="#EAF3FF" stroke="#CADFFF" stroke-width="1.5"/>
+    <rect x="273" y="175" width="726" height="470" rx="24" fill="#F9FBFF" stroke="#DDE7F4" stroke-width="1.5"/>
+    <rect x="1017" y="175" width="238" height="470" rx="24" fill="#EAF9F2" stroke="#C7EBDD" stroke-width="1.5"/>
+
+    <text x="66" y="209" font-size="13" font-weight="800" letter-spacing="1.7" fill="#3884C8">01  INPUT</text>
+    <text x="66" y="241" font-size="23" font-weight="800" fill="#183350">영상 입력</text>
+    <text x="295" y="209" font-size="13" font-weight="800" letter-spacing="1.7" fill="#6277C3">02  ANALYSIS SERVER</text>
+    <text x="295" y="241" font-size="23" font-weight="800" fill="#263657">Python · Flask</text>
+    <text x="1039" y="209" font-size="13" font-weight="800" letter-spacing="1.7" fill="#2A9C74">03  CLIENT</text>
+    <text x="1039" y="241" font-size="23" font-weight="800" fill="#1C5849">Flutter 앱</text>
+
+    <!-- Input card -->
+    <rect x="65" y="289" width="169" height="172" rx="19" fill="#FFFFFF" filter="url(#shadow)"/>
+    <rect x="84" y="309" width="54" height="44" rx="10" fill="#DBEDFF"/>
+    <rect x="94" y="320" width="27" height="22" rx="4" fill="none" stroke="#327FC6" stroke-width="2.5"/>
+    <path d="M121 325L130 320V342L121 337" fill="none" stroke="#327FC6" stroke-width="2.5" stroke-linejoin="round"/>
+    <text x="84" y="388" font-size="20" font-weight="800" fill="#213D60">주차장 영상</text>
+    <text x="84" y="416" font-size="15" fill="#59718D">55호관 · 도서관</text>
+    <text x="84" y="438" font-size="14" fill="#59718D">영상 파일 / RTSP</text>
+    <rect x="65" y="486" width="169" height="86" rx="15" fill="#DCEBFF"/>
+    <text x="81" y="519" font-size="16" font-weight="700" fill="#285F9A">주차면 좌표</text>
+    <text x="81" y="543" font-size="14" fill="#4E7199">주차장별 다각형 정의</text>
+
+    <!-- Processing cards -->
+    <rect x="295" y="289" width="150" height="164" rx="18" fill="#FFFFFF" filter="url(#shadow)"/>
+    <rect x="295" y="289" width="150" height="7" rx="3.5" fill="#3693DB"/>
+    <circle cx="321" cy="323" r="15" fill="#DDF0FF"/>
+    <text x="316" y="329" font-size="16" font-weight="800" fill="#207AC0">1</text>
+    <text x="314" y="367" font-size="19" font-weight="800" fill="#243A58">OpenCV</text>
+    <text x="314" y="394" font-size="14" fill="#63758C">프레임 읽기</text>
+    <text x="314" y="416" font-size="14" fill="#63758C">5프레임당 1회 추론</text>
+
+    <rect x="467" y="289" width="150" height="164" rx="18" fill="#FFFFFF" filter="url(#shadow)"/>
+    <rect x="467" y="289" width="150" height="7" rx="3.5" fill="#8866D9"/>
+    <circle cx="493" cy="323" r="15" fill="#EEE7FF"/>
+    <text x="488" y="329" font-size="16" font-weight="800" fill="#7050C5">2</text>
+    <text x="486" y="367" font-size="19" font-weight="800" fill="#243A58">YOLOv8</text>
+    <text x="486" y="394" font-size="14" fill="#63758C">빈자리 / 점유</text>
+    <text x="486" y="416" font-size="14" fill="#63758C">탐지 박스·신뢰도</text>
+
+    <rect x="639" y="289" width="150" height="164" rx="18" fill="#FFFFFF" filter="url(#shadow)"/>
+    <rect x="639" y="289" width="150" height="7" rx="3.5" fill="#E4A13B"/>
+    <circle cx="665" cy="323" r="15" fill="#FFF2DD"/>
+    <text x="660" y="329" font-size="16" font-weight="800" fill="#C68222">3</text>
+    <text x="658" y="367" font-size="19" font-weight="800" fill="#243A58">공간 매핑</text>
+    <text x="658" y="394" font-size="14" fill="#63758C">다각형 × 탐지 박스</text>
+    <text x="658" y="416" font-size="14" fill="#63758C">겹침 비율·신뢰도</text>
+
+    <rect x="811" y="289" width="166" height="164" rx="18" fill="#FFFFFF" filter="url(#shadow)"/>
+    <rect x="811" y="289" width="166" height="7" rx="3.5" fill="#2CB38B"/>
+    <circle cx="837" cy="323" r="15" fill="#DEF8EE"/>
+    <text x="832" y="329" font-size="16" font-weight="800" fill="#15966F">4</text>
+    <text x="830" y="367" font-size="19" font-weight="800" fill="#243A58">상태 안정화</text>
+    <text x="830" y="394" font-size="14" fill="#63758C">시간 가중 필터</text>
+    <text x="830" y="416" font-size="14" fill="#63758C">5회 / 8회 상태 전이</text>
+
+    <!-- Storage and API cards -->
+    <rect x="466" y="506" width="214" height="105" rx="18" fill="#E9F8F1" stroke="#A9E5C8" stroke-width="1.4"/>
+    <circle cx="491" cy="535" r="11" fill="#32AC7A"/>
+    <text x="512" y="542" font-size="20" font-weight="800" fill="#1D6851">SQLite</text>
+    <text x="485" y="571" font-size="14" fill="#52796A">주차면 상태 · 입출차 이력</text>
+    <text x="485" y="591" font-size="14" fill="#52796A">5분 간격 점유율 기록</text>
+
+    <rect x="726" y="506" width="251" height="105" rx="18" fill="#E9F2FF" stroke="#B4D1FA" stroke-width="1.4"/>
+    <circle cx="752" cy="535" r="11" fill="#488BDD"/>
+    <text x="773" y="542" font-size="20" font-weight="800" fill="#265EAA">Flask REST API</text>
+    <text x="745" y="571" font-size="14" fill="#5B769B">주차 현황 · 시간대별 통계</text>
+    <text x="745" y="591" font-size="14" fill="#5B769B">관리 기능 · MJPEG 스트림</text>
+
+    <!-- Client cards -->
+    <rect x="1038" y="289" width="196" height="130" rx="18" fill="#FFFFFF" filter="url(#shadow)"/>
+    <circle cx="1063" cy="318" r="11" fill="#D8F5E8"/>
+    <text x="1083" y="325" font-size="19" font-weight="800" fill="#1C6850">운전자 화면</text>
+    <text x="1056" y="359" font-size="14" fill="#57786B">캠퍼스 지도 · 빈자리</text>
+    <text x="1056" y="382" font-size="14" fill="#57786B">주차면 상세 · 통계</text>
+
+    <rect x="1038" y="454" width="196" height="130" rx="18" fill="#FFFFFF" filter="url(#shadow)"/>
+    <circle cx="1063" cy="483" r="11" fill="#FFE9C8"/>
+    <text x="1083" y="490" font-size="19" font-weight="800" fill="#8A5B1D">관리자 화면</text>
+    <text x="1056" y="524" font-size="14" fill="#806D52">영상 소스 · 좌표 설정</text>
+    <text x="1056" y="547" font-size="14" fill="#806D52">모니터링 시작 / 중지</text>
+
+    <!-- Connections, kept behind no labels and away from card text -->
+    <path d="M234 369H288" fill="none" stroke="#4385DC" stroke-width="3" marker-end="url(#arrow-blue)"/>
+    <path d="M445 369H460" fill="none" stroke="#4385DC" stroke-width="3" marker-end="url(#arrow-blue)"/>
+    <path d="M617 369H632" fill="none" stroke="#4385DC" stroke-width="3" marker-end="url(#arrow-blue)"/>
+    <path d="M789 369H804" fill="none" stroke="#4385DC" stroke-width="3" marker-end="url(#arrow-blue)"/>
+    <path d="M894 453V479H573V499" fill="none" stroke="#21A77C" stroke-width="2.8" marker-end="url(#arrow-green)"/>
+    <path d="M894 479H851V499" fill="none" stroke="#4385DC" stroke-width="2.8" marker-end="url(#arrow-blue)"/>
+    <path d="M680 559H719" fill="none" stroke="#21A77C" stroke-width="2.8" marker-end="url(#arrow-green)"/>
+    <path d="M977 541H1009V354H1031" fill="none" stroke="#4385DC" stroke-width="2.8" marker-end="url(#arrow-blue)"/>
+    <path d="M1038 519H1000V577H984" fill="none" stroke="#D99427" stroke-width="2.8" marker-end="url(#arrow-orange)"/>
+
+    <text x="46" y="690" font-size="14" fill="#667A91">파란 선: 상태 조회·응답</text>
+    <circle cx="267" cy="685" r="4.5" fill="#21A77C"/>
+    <text x="280" y="690" font-size="14" fill="#667A91">초록 선: 상태·이력 저장</text>
+    <circle cx="512" cy="685" r="4.5" fill="#D99427"/>
+    <text x="525" y="690" font-size="14" fill="#667A91">주황 선: 관리자 제어 요청</text>
+    <text x="1254" y="690" text-anchor="end" font-size="14" font-weight="700" fill="#90A0B3">BINJARI</text>
+  </g>
+</svg>
