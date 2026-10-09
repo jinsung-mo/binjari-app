@@ -1,1 +1,4 @@
+#include? "Pods/Target Support Files/Pods-Runner/Pods-Runner.debug.xcconfig"
 #include "Generated.xcconfig"
+// Google Maps API 키: ios/Flutter/Secrets.xcconfig 에 MAPS_API_KEY=... 형식으로 지정 (git 제외)
+#include? "Secrets.xcconfig"

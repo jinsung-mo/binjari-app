@@ -10,10 +10,10 @@
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
 
-        <!-- Google Maps API Key -->
+        <!-- Google Maps API Key: android/local.properties 의 MAPS_API_KEY 값이 빌드 시 주입됨 -->
         <meta-data
             android:name="com.google.android.geo.API_KEY"
-            android:value="AIzaSyBqClpv6rBxd0zPxDkk-HuJFGERzNbsQAU" />
+            android:value="${MAPS_API_KEY}" />
 
         <activity
             android:name=".MainActivity"

@@ -11,14 +11,10 @@ import '../services/location_service.dart';
 import '../models/parking_model.dart';
 import '../config/app_config.dart';
 import '../screens/home_screen.dart';
-import '../widgets/common_widgets.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:geocoding/geocoding.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 
-// Conditionally import Google Maps
-import 'package:google_maps_flutter/google_maps_flutter.dart'
-    if (dart.library.js_util) 'package:google_maps_flutter_web/google_maps_flutter_web.dart';
 
 class CampusMapScreen extends StatefulWidget {
   const CampusMapScreen({Key? key}) : super(key: key);

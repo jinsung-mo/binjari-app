@@ -28,7 +28,7 @@
 		<key>io.flutter.embedded_views_preview</key>
 		<true/>
 		<key>GMSApiKey</key>
-		<string>AIzaSyBqClpv6rBxd0zPxDkk-HuJFGERzNbsQAU</string>
+		<string>$(MAPS_API_KEY)</string>
 		<!-- 위치 권한 설명 -->
 		<key>NSLocationWhenInUseUsageDescription</key>
 		<string>주차장 위치를 확인하기 위해 위치 정보 접근 권한이 필요합니다.</string>

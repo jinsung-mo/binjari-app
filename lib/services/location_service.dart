@@ -1,6 +1,5 @@
 // services/location_service.dart
 import 'dart:async';
-import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:geocoding/geocoding.dart';
 import '../config/app_config.dart';

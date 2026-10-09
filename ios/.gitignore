@@ -32,3 +32,6 @@ Runner/GeneratedPluginRegistrant.*
 !default.mode2v3
 !default.pbxuser
 !default.perspectivev3
+
+# Google Maps API 키 (커밋 금지)
+Flutter/Secrets.xcconfig

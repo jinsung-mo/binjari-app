@@ -6,13 +6,16 @@ YOLOv8를 활용한 차량 인식 및 관리 시스템 (개선된 버전)
 """
 
 import os
+import sys
+import json
+import hmac
+import secrets
 import time
 import cv2
 import numpy as np
 import sqlite3
-import ctypes
-import msvcrt
-from datetime import datetime
+from datetime import datetime, timedelta
+from functools import wraps
 import threading
 import argparse
 import traceback
@@ -47,22 +50,47 @@ def find_file_in_paths(file_name, possible_paths):
 
 
 def get_font_path():
-    """시스템에 설치된 폰트 중 한글 지원 폰트 찾기"""
-    # Windows 기본 폰트 경로 검색
-    font_paths = [
-        os.path.join(os.environ['WINDIR'], 'Fonts', 'malgun.ttf'),  # 맑은 고딕
-        os.path.join(os.environ['WINDIR'], 'Fonts', 'gulim.ttc'),  # 굴림
-        os.path.join(os.environ['WINDIR'], 'Fonts', 'batang.ttc'),  # 바탕
-        os.path.join(os.environ['WINDIR'], 'Fonts', 'Arial.ttf'),  # 영문 폰트 (폴백)
+    """시스템에 설치된 폰트 중 한글 지원 폰트 찾기 (Windows / macOS / Linux)"""
+    font_paths = [os.getenv('FONT_PATH')]
+
+    windir = os.environ.get('WINDIR')
+    if windir:
+        font_paths += [
+            os.path.join(windir, 'Fonts', 'malgun.ttf'),  # 맑은 고딕
+            os.path.join(windir, 'Fonts', 'gulim.ttc'),  # 굴림
+            os.path.join(windir, 'Fonts', 'batang.ttc'),  # 바탕
+        ]
+
+    font_paths += [
+        '/System/Library/Fonts/AppleSDGothicNeo.ttc',  # macOS
+        '/System/Library/Fonts/Supplemental/AppleGothic.ttf',  # macOS
+        '/usr/share/fonts/truetype/nanum/NanumGothic.ttf',  # Linux (fonts-nanum)
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',  # Linux (fonts-noto-cjk)
     ]
 
-    # 폰트 파일 찾기
     for path in font_paths:
-        if os.path.exists(path):
+        if path and os.path.exists(path):
             return path
 
     # 폰트를 찾지 못했을 경우
     return None
+
+
+# 폰트 로드는 비용이 크므로 크기별로 캐시
+_FONT_PATH = get_font_path()
+_FONT_CACHE = {}
+
+
+def _get_font(font_size):
+    if font_size not in _FONT_CACHE:
+        font = None
+        if _FONT_PATH:
+            try:
+                font = ImageFont.truetype(_FONT_PATH, font_size)
+            except Exception:
+                font = None
+        _FONT_CACHE[font_size] = font or ImageFont.load_default()
+    return _FONT_CACHE[font_size]
 
 
 # 3. 한글 텍스트를 이미지에 표시하는 함수
@@ -73,15 +101,7 @@ def put_text_pil(img, text, position, font_size=16, color=(255, 255, 255), backg
     draw = ImageDraw.Draw(img_pil)
 
     # 폰트 설정
-    font_path = get_font_path()
-    if font_path:
-        try:
-            font = ImageFont.truetype(font_path, font_size)
-        except Exception:
-            # 폰트 로드 실패 시 기본 폰트 사용
-            font = ImageFont.load_default()
-    else:
-        font = ImageFont.load_default()
+    font = _get_font(font_size)
 
     # 배경이 설정된 경우
     if background:
@@ -107,45 +127,81 @@ def put_text_pil(img, text, position, font_size=16, color=(255, 255, 255), backg
     return result
 
 
-# 모델 경로 설정
+# 모델 경로 설정 (MODEL_PATH 환경 변수가 최우선)
 MODEL_PATHS = [
     os.getenv('MODEL_PATH'),
-    os.path.join(BASE_DIR, r'C:\Users\user\Desktop\Flutter\server\models', 'best_seo.pt'),
+    os.path.join(BASE_DIR, 'models', 'best.pt'),
+    os.path.join(BASE_DIR, 'models', 'best_seo.pt'),
     os.path.join(os.getcwd(), 'best(v8).pt'),
     os.path.join(os.getcwd(), 'models', 'best(v8).pt'),
     os.path.join(BASE_DIR, 'best(v8).pt'),
     os.path.join(BASE_DIR, '..', 'best(v8).pt'),
     os.path.join(BASE_DIR, '..', 'models', 'best(v8).pt')
 ]
-MODEL_PATH = find_file_in_paths("best model", MODEL_PATHS) or MODEL_PATHS[0]
+MODEL_PATH = find_file_in_paths("best model", MODEL_PATHS) or os.path.join(BASE_DIR, 'models', 'best.pt')
+
+# 비디오 파일 디렉터리 (동적 주차장 추가 시 이 디렉터리 안의 파일만 허용)
+VIDEOS_DIR = os.getenv('VIDEOS_DIR', os.path.join(BASE_DIR, 'videos'))
 
 # 비디오 소스 경로 설정
 VIDEO_SOURCES = {}
 
 
-def setup_video_sources():
-    """비디오 소스 경로 설정 및 유효성 검증 (도서관 추가 버전)"""
-    global VIDEO_SOURCES
+def _generate_test_video(output_path, duration=10, fps=30):
+    """테스트 컬러 비디오 생성 (실제 파일을 찾지 못한 경우 대체용)"""
+    try:
+        width, height = 640, 480
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    # 주차장별 비디오 경로 설정 (우선순위 순서대로)
+        # 다양한 색상 패턴으로 테스트 프레임 생성
+        frames = fps * duration
+        for i in range(frames):
+            # 배경 색상 설정 (시간에 따라 색조가 변함)
+            hue = int((i / frames) * 180)  # 0-180 범위의 색조
+            color_bg = np.zeros((height, width, 3), dtype=np.uint8)
+            color_bg[:, :, 0] = hue  # 색조 설정
+            color_bg[:, :, 1] = 200  # 채도 설정
+            color_bg[:, :, 2] = 200  # 명도 설정
+            frame = cv2.cvtColor(color_bg, cv2.COLOR_HSV2BGR)
+
+            # 안내 텍스트 표시 (cv2.putText는 한글을 지원하지 않으므로 영문 사용)
+            cv2.putText(frame, "TEST VIDEO - video file not found", (50, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(frame, "Check VIDEO_PATH_* settings", (50, 100),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+            # 타임스탬프 표시
+            cv2.putText(frame, f"frame: {i}/{frames}", (width - 200, height - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            out.write(frame)
+
+        out.release()
+        logger.info(f"테스트 비디오 생성 완료: {output_path}")
+        return True
+    except Exception as e:
+        logger.error(f"테스트 비디오 생성 중 오류: {e}")
+        return False
+
+
+def setup_video_sources():
+    """비디오 소스 경로 설정 및 유효성 검증"""
+    # 주차장별 비디오 경로 후보 (우선순위 순서대로)
     video_paths = {
-        'parking_lot_A': [
-            os.getenv('VIDEO_PATH'),
-            r'parking_best.mp4',
+        'parking_lot_A': [  # 55호관 주차장
+            os.getenv('VIDEO_PATH_A'),
+            os.getenv('VIDEO_PATH'),  # 이전 버전 호환
+            os.path.join(VIDEOS_DIR, 'parking_best.mp4'),
+            os.path.join(VIDEOS_DIR, 'parking_lot_A.mp4'),
             os.path.join(os.getcwd(), 'parking_best.mp4'),
-            r'C:\Users\user\Desktop\Flutter\parking_best.mp4',
-            os.path.join(BASE_DIR, 'videos', 'parking_lot_A.mp4'),
-            os.path.join(BASE_DIR, 'videos', 'parking_best.mp4'),
-            os.path.join(BASE_DIR, '..', 'Flutter', 'parking_best.mp4'),
-            os.path.join(os.path.expanduser('~'), 'Videos', 'parking_best.mp4'),
-            os.path.join('C:\\', 'Videos', 'parking_best.mp4')
         ],
-        'parking_lot_B': [  # 도서관 주차장 추가
-            r'C:\Users\user\Desktop\Flutter\library.mp4',
+        'parking_lot_B': [  # 도서관 주차장
+            os.getenv('VIDEO_PATH_B'),
+            os.path.join(VIDEOS_DIR, 'library2.mp4'),
+            os.path.join(VIDEOS_DIR, 'library.mp4'),
+            os.path.join(VIDEOS_DIR, 'parking_lot_B.mp4'),
             os.path.join(os.getcwd(), 'library.mp4'),
-            os.path.join(BASE_DIR, 'videos', 'library.mp4'),
-            os.path.join(BASE_DIR, '..', 'Flutter', 'library.mp4'),
-            os.path.join(os.path.expanduser('~'), 'Videos', 'library.mp4'),
         ]
     }
 
@@ -167,80 +223,28 @@ def setup_video_sources():
                             found_path = ext_path
                             logger.info(f"다른 확장자로 비디오 파일 발견: {ext_path}")
                             break
+                if found_path:
+                    break
 
         if found_path:
             VIDEO_SOURCES[parking_lot] = found_path
             logger.info(f"비디오 소스 '{parking_lot}'에 경로를 설정했습니다: {found_path}")
         else:
             logger.warning(f"경고: 비디오 소스 '{parking_lot}'의 모든 경로를 찾을 수 없습니다.")
-            logger.info(f"테스트 컬러 영상을 생성합니다.")
+            logger.info("테스트 컬러 영상을 생성합니다.")
             test_path = os.path.join(BASE_DIR, f'test_video_{parking_lot}.avi')
             _generate_test_video(test_path)
             VIDEO_SOURCES[parking_lot] = test_path
 
-# 프로그램 시작 시 비디오 소스 설정
-setup_video_sources()
-
-
-def _generate_test_video(output_path, duration=10, fps=30):
-    """테스트 컬러 비디오 생성 (실제 파일을 찾지 못한 경우 대체용)"""
-    try:
-        width, height = 640, 480
-        fourcc = cv2.VideoWriter_fourcc(*'XVID')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
-        # 다양한 색상 패턴으로 테스트 프레임 생성
-        frames = fps * duration
-        for i in range(frames):
-            # 시간에 따라 색상이 변하는 프레임 생성
-            frame = np.zeros((height, width, 3), dtype=np.uint8)
-
-            # 배경 색상 설정 (시간에 따라 변함)
-            hue = int((i / frames) * 180)  # 0-180 범위의 색조
-            color_bg = np.ones((height, width, 3), dtype=np.uint8) * 255
-            color_bg = cv2.cvtColor(color_bg, cv2.COLOR_BGR2HSV)
-            color_bg[:, :, 0] = hue  # 색조 설정
-            color_bg[:, :, 1] = 200  # 채도 설정
-            color_bg[:, :, 2] = 200  # 명도 설정
-            frame = cv2.cvtColor(color_bg, cv2.COLOR_HSV2BGR)
-
-            # 안내 텍스트 표시
-            cv2.putText(frame, "테스트 비디오 - 비디오 파일을 찾을 수 없음", (50, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(frame, "실제 비디오 파일 경로를 확인하세요", (50, 100),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-            # 주차 공간 시뮬레이션 (예시)
-            for j, coords in enumerate([
-                [(100, 150), (200, 150), (200, 250), (100, 250)],  # A1
-                [(250, 150), (350, 150), (350, 250), (250, 250)],  # A2
-                [(100, 300), (200, 300), (200, 400), (100, 400)],  # B1
-                [(250, 300), (350, 300), (350, 400), (250, 400)]  # B2
-            ]):
-                # 주차 공간 상태 시뮬레이션 (2초마다 변경)
-                is_occupied = (i // (fps * 2)) % 2 == j % 2
-                color = (0, 0, 255) if is_occupied else (0, 255, 0)  # 빨간색 또는 녹색
-                cv2.polylines(frame, [np.array(coords, np.int32)], True, color, 2)
-                space_id = f"{'A' if j < 2 else 'B'}{j % 2 + 1}"
-                cv2.putText(frame, space_id, (coords[0][0] + 30, coords[0][1] + 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-            # 타임스탬프 표시
-            time_str = f"프레임: {i}/{frames}"
-            cv2.putText(frame, time_str, (width - 200, height - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-            out.write(frame)
-
-        out.release()
-        logger.info(f"테스트 비디오 생성 완료: {output_path}")
-        return True
-    except Exception as e:
-        logger.error(f"테스트 비디오 생성 중 오류: {e}")
-        return False
 
 # 데이터베이스 경로
-DB_PATH = os.path.join(BASE_DIR, 'parking_system.db')
+DB_PATH = os.getenv('DB_PATH', os.path.join(BASE_DIR, 'parking_system.db'))
+
+# 점유율 기록 간격 (시간대별 통계는 이 샘플들의 평균)
+OCCUPANCY_RECORD_INTERVAL = timedelta(minutes=5)
+
+# B1 보정 규칙을 적용할 주차장 (55호관)
+B1_CORRECTION_LOT = 'parking_lot_A'
 
 # 주차 공간 좌표 (주차장 별 주차 공간 좌표 정의)
 PARKING_SPACES = {
@@ -264,7 +268,7 @@ PARKING_SPACES = {
         {"id": "B5", "coords": [(519, 369), (551, 577), (686, 579), (631, 367)]},
         {"id": "B6", "coords": [(631, 367), (688, 579), (826, 574), (748, 363)]},
         {"id": "B7", "coords": [(747, 363), (824, 571), (966, 573), (867, 359)]},
-        {"id": "B8", "coords": [(867, 358), (968, 572), (968, 355), (867, 358)]},
+        {"id": "B8", "coords": [(867, 358), (968, 572), (968, 355)]},  # 화면 가장자리에 걸친 칸이라 삼각형
     ],
     'parking_lot_B': [  # 새로 추가된 도서관 주차장
         {"id": "A1", "coords": [(95, 144), (46, 193), (0, 189), (1, 135)]},
@@ -303,7 +307,6 @@ PARKING_SPACES = {
         {"id": "D4electric", "coords": [(864, 391), (887, 449), (1030, 454), (1003, 393)]},
         {"id": "D5electric", "coords": [(886, 450), (930, 550), (1078, 555), (1028, 453)]},
         {"id": "D6disabled", "coords": [(930, 549), (981, 680), (1154, 684), (1078, 554)]},
-        {"id": "D7disabled", "coords": [(930, 549), (981, 680), (1154, 684), (1078, 554)]},
     ]
 }
 
@@ -330,34 +333,33 @@ def close_db(e=None):
 
 
 def init_db():
-    """데이터베이스 스키마 초기화"""
+    """데이터베이스 스키마 초기화 (이전 버전 스키마 자동 마이그레이션 포함)"""
     with app.app_context():
         db = get_db()
         cursor = db.cursor()
 
-        # 필요한 테이블 생성
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS parking_records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            spot_id TEXT,
-            vehicle_id TEXT,
-            entry_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            exit_time TIMESTAMP,
-            status TEXT
-        )
-        ''')
+        # 이전 버전은 parking_spaces의 기본 키가 주차면 ID뿐이라 주차장 간 ID(A1 등)가 충돌했음.
+        # 현재 상태 캐시 테이블이므로 구 스키마면 삭제 후 재생성
+        cursor.execute("PRAGMA table_info(parking_spaces)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if columns and 'parking_lot' not in columns:
+            logger.info("구 버전 parking_spaces 테이블을 새 스키마로 재생성합니다")
+            cursor.execute("DROP TABLE parking_spaces")
 
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS parking_spaces (
-            id TEXT PRIMARY KEY,
+            parking_lot TEXT NOT NULL,
+            id TEXT NOT NULL,
             status TEXT DEFAULT 'empty',
-            last_updated TIMESTAMP
+            last_updated TIMESTAMP,
+            PRIMARY KEY (parking_lot, id)
         )
         ''')
 
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS vehicles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            parking_lot TEXT,
             parking_space_id TEXT,
             entry_time TIMESTAMP,
             exit_time TIMESTAMP,
@@ -365,7 +367,12 @@ def init_db():
         )
         ''')
 
-        # 점유율 기록 테이블 추가
+        # 구 버전 vehicles 테이블에 parking_lot 컬럼 추가
+        cursor.execute("PRAGMA table_info(vehicles)")
+        if 'parking_lot' not in [row[1] for row in cursor.fetchall()]:
+            cursor.execute("ALTER TABLE vehicles ADD COLUMN parking_lot TEXT")
+
+        # 점유율 기록 테이블 (5분 간격 샘플)
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS occupancy_rates (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -376,7 +383,7 @@ def init_db():
         )
         ''')
 
-        # 주차장 설정 테이블 추가
+        # 주차장 설정 테이블
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS parking_lots (
             id TEXT PRIMARY KEY,
@@ -395,7 +402,7 @@ def init_db():
         )
         ''')
 
-        # 주차장 좌표 테이블 추가
+        # 주차장 지도 영역 좌표 (위경도 다각형)
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS parking_spaces_coords (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -408,8 +415,76 @@ def init_db():
         )
         ''')
 
+        # 영상 내 주차면 다각형 좌표 (픽셀). 업로드/동적 추가한 좌표를 재시작 후에도 유지
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS parking_space_polygons (
+            parking_lot_id TEXT PRIMARY KEY,
+            spaces_json TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+
         db.commit()
         logger.info("데이터베이스 초기화 완료")
+
+
+def save_space_polygons(db, parking_lot_id, spaces):
+    """주차면 픽셀 좌표를 DB에 저장"""
+    db.execute(
+        "INSERT OR REPLACE INTO parking_space_polygons (parking_lot_id, spaces_json, updated_at) "
+        "VALUES (?, ?, CURRENT_TIMESTAMP)",
+        (parking_lot_id, json.dumps(spaces))
+    )
+
+
+def load_persisted_parking_lots():
+    """DB에 저장된 동적 주차장과 업로드된 주차면 좌표를 메모리 설정에 복원"""
+    with app.app_context():
+        db = get_db()
+        cursor = db.cursor()
+
+        cursor.execute("SELECT parking_lot_id, spaces_json FROM parking_space_polygons")
+        for lot_id, spaces_json in cursor.fetchall():
+            try:
+                PARKING_SPACES[lot_id] = json.loads(spaces_json)
+                logger.info(f"저장된 주차면 좌표 복원: {lot_id} ({len(PARKING_SPACES[lot_id])}개)")
+            except ValueError:
+                logger.error(f"주차면 좌표 파싱 실패: {lot_id}")
+
+        # 동적 추가 API로 등록된 주차장(주차면 좌표 행이 있는 주차장)만 영상 처리 대상으로 복원
+        cursor.execute('''
+            SELECT l.id, l.video_source FROM parking_lots l
+            JOIN parking_space_polygons p ON p.parking_lot_id = l.id
+            WHERE l.video_source IS NOT NULL AND l.video_source != ''
+        ''')
+        for lot_id, video_source in cursor.fetchall():
+            resolved = resolve_video_source(video_source)
+            if lot_id not in VIDEO_SOURCES and resolved:
+                VIDEO_SOURCES[lot_id] = resolved
+                PARKING_SPACES.setdefault(lot_id, [])
+                logger.info(f"동적 주차장 복원: {lot_id} -> {VIDEO_SOURCES[lot_id]}")
+
+
+def resolve_video_source(video_source):
+    """
+    영상 소스 검증. 스트림 URL(rtsp/http)이거나 VIDEOS_DIR 안에 실제로 존재하는 파일만 허용.
+    유효하면 사용할 경로(또는 URL)를, 아니면 None을 반환
+    """
+    if not video_source:
+        return None
+    if video_source.startswith(('rtsp://', 'http://', 'https://')):
+        return video_source
+
+    videos_dir = os.path.realpath(VIDEOS_DIR)
+    candidate = video_source if os.path.isabs(video_source) else os.path.join(videos_dir, video_source)
+    candidate = os.path.realpath(candidate)
+    try:
+        inside_videos_dir = os.path.commonpath([videos_dir, candidate]) == videos_dir
+    except ValueError:  # Windows에서 드라이브가 다른 경우
+        inside_videos_dir = False
+    if not inside_videos_dir or not os.path.isfile(candidate):
+        return None
+    return candidate
 
 
 class ParkingSystem:
@@ -420,331 +495,171 @@ class ParkingSystem:
         self.parking_status = {}  # 주차 공간 상태 저장
         self.video_threads = {}  # 비디오 처리 스레드 저장
         self.running = False
-        self.frame_skip = 5  # 성능 향상을 위한 프레임 스킵 수
-        self.space_status_history = {}  # 상태 히스토리 초기화
+        self.frame_skip = 5  # 5프레임 중 1프레임만 추론 (연산량 80% 감소)
+        self.status_lock = threading.RLock()  # 스레드 간 상태 공유용 락
 
-        # 영상 표시 설정
+        # 영상 표시 설정 (OpenCV GUI 호출은 모두 메인 스레드에서만 수행)
         self.show_video = show_video
-        self.current_frames = {}  # 주차장별 현재 프레임 저장 (화면 표시용)
+        self.current_frames = {}  # 주차장별 현재 프레임 (스트림 API 및 화면 표시용)
+        self.message_frames = set()  # 현재 프레임이 안내/오류 메시지 화면인 주차장
         self.display_width = 1024  # 화면 표시 너비
         self.display_height = 768  # 화면 표시 높이
-
-        # 창 관리를 위한 변수들
         self.window_names = {}  # 주차장별 창 이름
-        self.active_windows = {}  # 활성 창 상태 (True/False)
-        self.window_lock = threading.RLock()  # 창 생성/삭제 동기화를 위한 락
+        self.windows_enabled = show_video  # 'q'로 창을 닫아도 감지는 계속됨
+        self.display_paused = False
 
-        # 시간적 필터 및 상태 전이 모델 초기화
+        # 시간적 필터 및 상태 전이 모델 (주차장별)
         self.temporal_filters = {}
         self.state_machines = {}
+        self.last_occupancy_record = {}  # 주차장별 마지막 점유율 기록 시각
+        self.b1_empty_counters = {}  # 55호관 B1 보정용 연속 빈칸 카운터
 
-        # 중요: OpenCV 전체 초기화 - 이 부분이 중요합니다
-        # 기존 창이 있으면 모두 제거
-        if self.show_video:
+    # ---------- 화면 표시 (메인 스레드 전용) ----------
+
+    def _ensure_window(self, parking_lot):
+        """주차장별 표시 창 생성 (이미 있으면 재사용)"""
+        if parking_lot in self.window_names:
+            return self.window_names[parking_lot]
+
+        window_name = f"Parking Monitoring System - {parking_lot}"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, self.display_width, self.display_height)
+        self.window_names[parking_lot] = window_name
+        logger.info(f"창 초기화 완료: {window_name}")
+        return window_name
+
+    def _close_windows(self):
+        for window_name in self.window_names.values():
             try:
-                cv2.destroyAllWindows()
-                time.sleep(0.1)  # 창이 완전히 닫히도록 잠시 대기
-            except:
+                cv2.destroyWindow(window_name)
+            except cv2.error:
                 pass
-
-    def _init_window(self, parking_lot):
-        """비디오 창 초기화 (중복 창 방지 - 개선 버전)"""
-        if not self.show_video:
-            return None
-
-        with self.window_lock:  # 스레드 안전성 보장
-            # 이미 이 주차장에 대한 창이 생성되었는지 확인
-            window_exists = False
-            window_name = None
-
-            if parking_lot in self.window_names:
-                window_name = self.window_names[parking_lot]
-                try:
-                    # 창이 존재하는지 확인
-                    prop_val = cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE)
-                    window_exists = prop_val >= 0  # 창이 존재하고 표시되는 경우
-                except:
-                    window_exists = False
-
-            # 창이 존재하지 않으면 새로 생성
-            if not window_exists:
-                # 기존 창 이름이 있었다면 먼저 닫기 시도
-                if window_name:
-                    try:
-                        cv2.destroyWindow(window_name)
-                        time.sleep(0.1)  # 창이 완전히 닫히도록 잠시 대기
-                    except:
-                        pass
-
-                # 새 창 이름 생성 (주차장 ID와 현재 시간을 포함하여 고유성 보장)
-                timestamp = int(time.time())
-                window_name = f'Parking_{parking_lot}_{timestamp}'
-
-                # 창 생성 전 로그
-                logger.info(f"새 창 생성: {window_name}")
-
-                # 창 생성
-                cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-                cv2.resizeWindow(window_name, self.display_width, self.display_height)
-
-                # 화면 중앙에 배치
-                try:
-                    user32 = ctypes.windll.user32
-                    screen_width = user32.GetSystemMetrics(0)
-                    screen_height = user32.GetSystemMetrics(1)
-                except:
-                    screen_width = 1920  # 기본값
-                    screen_height = 1080
-
-                x_pos = (screen_width - self.display_width) // 2
-                y_pos = (screen_height - self.display_height) // 2
-                cv2.moveWindow(window_name, x_pos, y_pos)
-
-                # 창 상태 업데이트
-                self.window_names[parking_lot] = window_name
-                self.active_windows[parking_lot] = True
-
-                # 창 타이틀 설정 (한글 문제를 피하기 위해 영문 사용)
-                cv2.setWindowTitle(window_name, f"Parking Monitoring System - {parking_lot}")
-
-                logger.info(f"창 초기화 완료: {window_name}")
-            else:
-                logger.info(f"기존 창 재사용: {window_name}")
-                self.active_windows[parking_lot] = True
-
-            return window_name
-
-    def __del__(self):
-        """소멸자: 리소스 정리"""
-        # logger가 여전히 존재하는지 확인
-        log_func = logger.info if 'logger' in globals() and logger is not None else print
-        error_func = logger.error if 'logger' in globals() and logger is not None else print
-
+        self.window_names.clear()
         try:
-            # 실행 중인 경우 중지
-            if hasattr(self, 'running') and self.running:
-                self.running = False
-                log_func("소멸자에서 실행 중지됨")
+            cv2.waitKey(1)  # 창 닫기 이벤트 처리
+        except cv2.error:
+            pass
 
-            # 화면 창 닫기
-            if hasattr(self, 'show_video') and self.show_video:
-                for parking_lot in VIDEO_SOURCES.keys():
-                    try:
-                        cv2.destroyWindow(f'Parking Monitor - {parking_lot}')
-                    except:
-                        pass
-        except Exception as e:
-            error_func(f"소멸자에서 리소스 정리 중 오류 발생: {e}")
+    def update_display(self):
+        """
+        메인 스레드에서 주기적으로 호출. 각 주차장의 최신 프레임을 창에 그리고 키 입력을 처리.
+        macOS 등 일부 플랫폼은 워커 스레드에서 GUI를 호출하면 크래시가 나므로 여기서만 처리한다.
+        """
+        if not self.show_video:
+            return
+
+        if self.windows_enabled and not self.display_paused:
+            for parking_lot in list(VIDEO_SOURCES.keys()):
+                frame = self.current_frames.get(parking_lot)
+                if frame is None:
+                    continue
+                try:
+                    if parking_lot in self.message_frames:
+                        display = frame
+                    else:
+                        display = self._render_overlay(parking_lot, frame)
+                    cv2.imshow(self._ensure_window(parking_lot), display)
+                except cv2.error as e:
+                    # GUI를 지원하지 않는 OpenCV 빌드(headless) 또는 디스플레이가 없는 환경
+                    logger.warning(f"영상 창을 열 수 없어 화면 표시를 끕니다 (감지는 계속): {e}")
+                    self.show_video = False
+                    return
+                except Exception as e:
+                    logger.error(f"화면 표시 중 오류 발생: {e}")
+
+        key = cv2.waitKey(1) & 0xFF
+        if key != 255:
+            self._handle_key_press(key)
 
     def cleanup(self):
         """명시적 리소스 정리 (프로그램 종료 전 호출용)"""
-        # 실행 중인 경우 중지
         if self.running:
             self.stop()
             logger.info("시스템 정리 중 실행 중지됨")
 
-        # 화면 창 닫기
         if self.show_video:
-            for parking_lot, window_name in self.window_names.items():
-                try:
-                    cv2.destroyWindow(window_name)
-                    logger.info(f"창 닫기: {window_name}")
-                except:
-                    pass
-
-                # 상태 업데이트
-                self.active_windows[parking_lot] = False
-
-            # 모든 창 닫기 시도 (안전장치)
+            self._close_windows()
             try:
                 cv2.destroyAllWindows()
-                time.sleep(0.2)  # 창이 완전히 닫히도록 대기
-            except:
+            except cv2.error:
                 pass
 
         logger.info("시스템 리소스 정리 완료")
 
     def _load_model(self):
-        """YOLOv8 모델 로드"""
+        """
+        YOLOv8 주차면 상태 모델 로드.
+        이 모델은 space-empty(0) / space-occupied(1) 두 클래스로 학습된 커스텀 모델이다.
+        COCO 기본 모델(yolov8n.pt)은 클래스 체계가 달라(0=person, 1=bicycle) 결과가 무의미하므로
+        대체 모델로 사용하지 않고 명확한 오류로 종료한다.
+        """
+        if not os.path.exists(MODEL_PATH):
+            raise FileNotFoundError(
+                f"모델 파일을 찾을 수 없습니다: {MODEL_PATH}\n"
+                f"학습된 가중치(.pt)를 models/best.pt 에 두거나 MODEL_PATH 환경 변수로 경로를 지정하세요."
+            )
+
         try:
-            # 모델 파일 존재 여부 확인
-            if not os.path.exists(MODEL_PATH):
-                logger.warning(f"모델 파일을 찾을 수 없습니다: {MODEL_PATH}")
-                raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {MODEL_PATH}")
-
-            logger.info(f"모델 파일 크기: {os.path.getsize(MODEL_PATH) / (1024 * 1024):.2f} MB")
-
-            # ultralytics 패키지 설치 확인 및 설치
-            try:
-                from ultralytics import YOLO
-                logger.info("Ultralytics 패키지가 이미 설치되어 있습니다.")
-                ultralytics_installed = True
-            except ImportError:
-                logger.info("Ultralytics 패키지 설치 중...")
-                try:
-                    import subprocess, sys
-                    subprocess.check_call([sys.executable, "-m", "pip", "install", "ultralytics"])
-                    from ultralytics import YOLO
-                    logger.info("Ultralytics 패키지 설치 완료")
-                    ultralytics_installed = True
-                except Exception as e:
-                    logger.error(f"Ultralytics 패키지 설치 실패: {e}")
-                    ultralytics_installed = False
-
-            # YOLOv8 모델 로드
-            if ultralytics_installed:
-                try:
-                    from ultralytics import YOLO
-                    model = YOLO(MODEL_PATH)
-                    logger.info(f"YOLOv8 모델 '{MODEL_PATH}'을 성공적으로 로드했습니다.")
-                    return model
-                except Exception as e:
-                    logger.error(f"YOLOv8 모델 로드 실패: {e}")
-                    logger.error(f"상세 오류: {traceback.format_exc()}")
-
-            # 대체 방법: 기본 YOLOv8n 모델 로드
-            try:
-                from ultralytics import YOLO
-                model = YOLO('yolov8n.pt')  # 작은 사이즈의 YOLOv8 기본 모델
-                logger.info("기본 YOLOv8n 모델을 로드했습니다.")
-                return model
-            except Exception as e:
-                logger.error(f"기본 YOLOv8n 모델 로드 실패: {e}")
-                logger.error(f"상세 오류: {traceback.format_exc()}")
-
-            raise Exception("모든 YOLOv8 모델 로드 방법이 실패했습니다.")
-
-        except Exception as e:
-            logger.error(f"모델 로드 실패 (상세 오류): {e}")
-            logger.error(f"상세 스택 트레이스: {traceback.format_exc()}")
-            logger.info("기본 YOLOv8n 모델을 로드합니다.")
-            # 모델을 로드할 수 없는 경우 기본 YOLOv8n 모델 사용
             from ultralytics import YOLO
-            model = YOLO('yolov8n.pt')
-            return model
+        except ImportError as e:
+            raise ImportError("ultralytics 패키지가 필요합니다: pip install -r requirements.txt") from e
 
-    def _handle_key_press(self, key, parking_lot):
-        """키 입력 처리 함수 (개별 창 종료 지원 - 수정 버전)"""
+        logger.info(f"모델 파일 크기: {os.path.getsize(MODEL_PATH) / (1024 * 1024):.2f} MB")
+        model = YOLO(MODEL_PATH)
+        logger.info(f"YOLOv8 모델 '{MODEL_PATH}'을 성공적으로 로드했습니다. 클래스: {getattr(model, 'names', None)}")
+        return model
+
+    def _handle_key_press(self, key):
+        """키 입력 처리 (영상 창에서 입력)"""
         if key == ord('q'):
-            # 'q' 키: 현재 창만 종료하고 감지는 계속 실행
-            logger.info(f"사용자가 'q' 키를 눌러 창을 종료합니다: {parking_lot}")
-            window_name = self.window_names.get(parking_lot)
-
-            if window_name:
-                with self.window_lock:
-                    try:
-                        # 창 닫기
-                        cv2.destroyWindow(window_name)
-                        # 상태 업데이트 - 창은 닫히지만 백그라운드 처리는 계속됨을 명시
-                        self.active_windows[parking_lot] = False
-                        # 중요: 로그에 백그라운드 처리가 계속됨을 명시
-                        logger.info(f"창 종료 완료: {window_name} (백그라운드 객체 감지는 계속 실행 중)")
-                    except Exception as e:
-                        logger.error(f"창 종료 중 오류: {e}")
-            return True  # 키 처리됨
-
+            # 창만 닫고 감지는 계속 실행
+            logger.info("사용자가 'q' 키를 눌러 창을 닫습니다 (백그라운드 감지는 계속 실행)")
+            self.windows_enabled = False
+            self._close_windows()
         elif key == ord('p'):
-            # 'p' 키: 일시 정지/재개
-            logger.info(f"사용자가 'p' 키를 눌러 일시 정지/재개합니다: {parking_lot}")
-            window_name = self.window_names.get(parking_lot)
-
-            if window_name and self.active_windows.get(parking_lot, False):
-                try:
-                    frame = self.current_frames.get(parking_lot, None)
-                    if frame is not None:
-                        pause_frame = frame.copy()
-                        pause_frame = put_text_pil(pause_frame, "일시 정지됨 - 계속하려면 아무 키나 누르세요",
-                                                   (50, 50), 24, color=(0, 0, 255))
-                        cv2.imshow(window_name, pause_frame)
-                        cv2.waitKey(0)  # 사용자가 키를 누를 때까지 대기
-                except Exception as e:
-                    logger.error(f"일시 정지 중 오류: {e}")
-            return True  # 키 처리됨
-
-        elif key == ord('r'):
-            # 'r' 키: 창 재활성화 (닫힌 경우)
-            if not self.active_windows.get(parking_lot, False):
-                logger.info(f"사용자가 'r' 키를 눌러 창을 재활성화합니다: {parking_lot}")
-                self._init_window(parking_lot)
-            return True  # 키 처리됨
-
+            self.display_paused = not self.display_paused
+            logger.info(f"화면 표시 {'일시 정지' if self.display_paused else '재개'}")
         elif key == ord('x'):
-            # 'x' 키: 모든 창을 닫고 시스템 종료
             logger.info("사용자가 'x' 키를 눌러 전체 시스템을 종료합니다")
-            self.running = False  # 전체 시스템 종료
-            return True  # 키 처리됨
+            self.running = False
 
-        return False  # 키 처리되지 않음
+    def _set_message_frame(self, parking_lot, lines, color=(255, 255, 255)):
+        """안내/오류 메시지 화면을 현재 프레임으로 설정"""
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        for i, (text, size) in enumerate(lines):
+            frame = put_text_pil(frame, text, (200, 200 + i * 100), size, color=color if i == 0 else (255, 255, 255))
+        self.current_frames[parking_lot] = frame
+        self.message_frames.add(parking_lot)
 
     def _process_video_file(self, parking_lot, video_path):
-        """
-        비디오 파일 처리 및 차량 감지 (참조 오류 수정 버전)
-        - window_name 변수 초기화 및 참조 오류 수정
-        """
-        # 로그 추가
+        """비디오 파일(또는 스트림) 처리 및 차량 감지. 워커 스레드에서 실행되며 GUI는 호출하지 않는다."""
         logger.info(f"비디오 처리 시작: {parking_lot}, 경로: {video_path}")
 
-        # 초기 환영 프레임 설정 (API 요청용)
-        welcome_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self._set_message_frame(parking_lot, [
+            (f"주차장 모니터링 시스템 - {parking_lot}", 30),
+            (f"비디오 로드 중: {os.path.basename(str(video_path))}", 24),
+            ("잠시만 기다려 주세요...", 24),
+        ])
 
-        # 한글 텍스트로 환영 메시지 작성
-        welcome_frame = put_text_pil(welcome_frame, f"주차장 모니터링 시스템 - {parking_lot}", (200, 200), 30)
-        welcome_frame = put_text_pil(welcome_frame, f"비디오 로드 중: {os.path.basename(video_path)}", (200, 300), 24)
-        welcome_frame = put_text_pil(welcome_frame, "잠시만 기다려 주세요...", (200, 400), 24)
-        welcome_frame = put_text_pil(welcome_frame, "창 종료: 'q' 키 / 전체 종료: 'x' 키", (200, 500), 20)
-
-        self.current_frames[parking_lot] = welcome_frame.copy()
-
-        # 창 초기화 - 중복 방지 로직 포함
-        # window_name 변수 초기화 (None으로)
-        window_name = None
-
-        # 화면 표시가 활성화된 경우에만 창 초기화
-        if self.show_video:
-            window_name = self._init_window(parking_lot)
-
-            # 화면에 환영 메시지 표시
-            if window_name and self.active_windows.get(parking_lot, False):
-                cv2.imshow(window_name, welcome_frame)
-                cv2.waitKey(100)  # GUI 이벤트 처리
-
-        # 비디오 파일이 존재하는지 확인
-        if not os.path.exists(video_path):
+        is_stream = str(video_path).startswith(('rtsp://', 'http://', 'https://'))
+        if not is_stream and not os.path.exists(video_path):
             logger.error(f"비디오 파일을 찾을 수 없음: {video_path}")
-
-            # 오류 프레임 생성 및 표시
-            error_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-            error_frame = put_text_pil(error_frame, "오류: 비디오 파일을 찾을 수 없습니다", (200, 200), 26, color=(0, 0, 255))
-            error_frame = put_text_pil(error_frame, f"경로: {video_path}", (200, 300), 20)
-            error_frame = put_text_pil(error_frame, "올바른 비디오 파일 경로를 설정하고 다시 시작하세요", (200, 400), 20)
-
-            self.current_frames[parking_lot] = error_frame
-
-            # window_name이 유효한 경우에만 화면에 표시
-            if self.show_video and window_name and self.active_windows.get(parking_lot, False):
-                cv2.imshow(window_name, error_frame)
-                cv2.waitKey(3000)  # 3초간 오류 메시지 표시
-
+            self._set_message_frame(parking_lot, [
+                ("오류: 비디오 파일을 찾을 수 없습니다", 26),
+                (f"경로: {video_path}", 20),
+            ], color=(0, 0, 255))
             return
 
+        thread_db = None
+        cap = None
         try:
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
-                logger.error(f"비디오 파일을 열 수 없음: {video_path}")
-
-                # 오류 프레임 생성 및 표시
-                error_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-                error_frame = put_text_pil(error_frame, "오류: 비디오 파일을 열 수 없습니다", (200, 200), 26, color=(0, 0, 255))
-                error_frame = put_text_pil(error_frame, f"경로: {video_path}", (200, 300), 20)
-                error_frame = put_text_pil(error_frame, "올바른 비디오 파일 형식인지 확인하세요", (200, 400), 20)
-
-                self.current_frames[parking_lot] = error_frame
-
-                # window_name이 유효한 경우에만 화면에 표시
-                if self.show_video and window_name and self.active_windows.get(parking_lot, False):
-                    cv2.imshow(window_name, error_frame)
-                    cv2.waitKey(3000)  # 3초간 오류 메시지 표시
-
+                logger.error(f"비디오를 열 수 없음: {video_path}")
+                self._set_message_frame(parking_lot, [
+                    ("오류: 비디오를 열 수 없습니다", 26),
+                    (f"경로: {video_path}", 20),
+                ], color=(0, 0, 255))
                 return
 
             # 비디오 정보 로깅
@@ -752,7 +667,6 @@ class ParkingSystem:
             frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             fps = cap.get(cv2.CAP_PROP_FPS)
             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
             logger.info(
                 f"비디오 '{video_path}' 정보: 크기 {frame_width}x{frame_height}, "
                 f"FPS {fps:.2f}, 총 프레임 수 {frame_count}"
@@ -760,71 +674,49 @@ class ParkingSystem:
 
             # 스레드별 데이터베이스 연결
             thread_db = sqlite3.connect(self.db_path)
-            logger.info(f"비디오 처리 스레드용 DB 연결 생성: {threading.current_thread().name}")
-
-            cursor = thread_db.cursor()
-            processed_frame_count = 0
+            read_frame_count = 0
+            detect_count = 0
             start_time = time.time()
 
-            # 메인 처리 루프
-            while self.running:
+            while self.running and VIDEO_SOURCES.get(parking_lot) == video_path:
                 try:
-                    # 프레임 읽기
                     ret, frame = cap.read()
 
                     # 비디오 끝에 도달하면 처음부터 다시 재생 (루프 재생)
                     if not ret:
+                        if is_stream:
+                            logger.warning(f"스트림 프레임 수신 실패: {video_path}, 재시도합니다")
+                            time.sleep(1)
+                            continue
                         logger.info(f"비디오 '{video_path}' 끝에 도달하여 처음부터 다시 재생합니다.")
                         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        # 루프 재생 안내 표시
-                        loop_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-                        loop_frame = put_text_pil(loop_frame, "비디오 재시작 중...", (200, 300), 30)
-
-                        self.current_frames[parking_lot] = loop_frame.copy()
-
-                        # window_name이 유효한 경우에만 화면에 표시
-                        if self.show_video and window_name and self.active_windows.get(parking_lot, False):
-                            cv2.imshow(window_name, loop_frame)
-                            cv2.waitKey(500)  # 0.5초간 재시작 메시지 표시
-
                         continue
 
-                    # 성능 향상을 위해 일부 프레임 건너뛰기
-                    processed_frame_count += 1
-                    if processed_frame_count % self.frame_skip != 0:
-                        # 중요: 건너뛰는 프레임에서도 이벤트 처리
-                        if (self.show_video and processed_frame_count % 10 == 0 and
-                                window_name and self.active_windows.get(parking_lot, False)):
-                            key = cv2.waitKey(1)
-                            if key != -1:  # 키가 눌린 경우
-                                self._handle_key_press(key, parking_lot)
+                    # 성능 향상을 위해 frame_skip 프레임마다 한 번만 추론
+                    read_frame_count += 1
+                    if read_frame_count % self.frame_skip != 0:
                         continue
 
                     # 차량 감지 수행 - 창 상태와 관계없이 항상 실행
                     self._detect_vehicles(frame, parking_lot, thread_db)
+                    detect_count += 1
 
-                    # 현재 프레임 저장 (화면 표시용 및 API 요청용)
-                    self.current_frames[parking_lot] = frame.copy()
+                    # 현재 프레임 저장 (화면 표시용 및 스트림 API용)
+                    self.current_frames[parking_lot] = frame
+                    self.message_frames.discard(parking_lot)
 
-                    # 100번째 프레임마다 로그 출력 (디버깅용)
-                    if processed_frame_count % 100 == 0:
+                    # 100번째 추론마다 로그 출력
+                    if detect_count % 100 == 0:
                         elapsed_time = time.time() - start_time
-                        fps_actual = processed_frame_count / elapsed_time if elapsed_time > 0 else 0
-                        logger.info(f"프레임 처리 중: {parking_lot}, 프레임 {processed_frame_count}, 실제 FPS: {fps_actual:.2f}")
-                        # 객체 감지가 계속 수행되는지 확인하기 위한 추가 로그
+                        fps_actual = detect_count / elapsed_time if elapsed_time > 0 else 0
+                        with self.status_lock:
+                            occupied_count = sum(1 for st in self.parking_status.get(parking_lot, {}).values()
+                                                 if st.get("status") == "occupied")
                         space_count = len(PARKING_SPACES.get(parking_lot, []))
-                        occupied_count = sum(1 for s in self.parking_status.get(parking_lot, {}).values()
-                                             if s.get("status") == "occupied")
-                        logger.info(f"현재 주차 상태: 총 {space_count}개 중 {occupied_count}개 점유됨")
-
-                    # 화면에 표시 (창이 활성화된 경우에만)
-                    if (self.show_video and window_name and self.active_windows.get(parking_lot, False)):
-                        self._display_frame(parking_lot, frame)
-
-                        # 키 입력 처리
-                        key = cv2.waitKey(1) & 0xFF
-                        if key != 255:  # 키가 눌린 경우
-                            self._handle_key_press(key, parking_lot)
+                        logger.info(
+                            f"{parking_lot}: 추론 {detect_count}회, 초당 추론 {fps_actual:.2f}회, "
+                            f"점유 {occupied_count}/{space_count}"
+                        )
 
                     # CPU 사용량 감소를 위한 짧은 대기
                     time.sleep(0.01)
@@ -832,170 +724,137 @@ class ParkingSystem:
                 except Exception as e:
                     logger.error(f"프레임 처리 중 오류 발생: {e}")
                     logger.error(traceback.format_exc())
-                    # 오류 발생 시 짧은 대기 후 계속
                     time.sleep(0.5)
 
-            # 연결 종료
-            thread_db.close()
-            logger.info(f"비디오 처리 스레드 DB 연결 종료: {threading.current_thread().name}")
-
-            cap.release()
             logger.info(f"비디오 '{video_path}' 처리 종료")
 
         except Exception as e:
             logger.error(f"비디오 처리 중 치명적 오류 발생: {e}")
             logger.error(traceback.format_exc())
+            self._set_message_frame(parking_lot, [
+                (f"치명적 오류 발생: {str(e)[:50]}", 24),
+                ("시스템을 재시작하세요", 24),
+            ], color=(0, 0, 255))
+        finally:
+            if thread_db is not None:
+                thread_db.close()
+            if cap is not None:
+                cap.release()
 
-            # 오류 프레임 표시
-            error_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-            error_frame = put_text_pil(error_frame, f"치명적 오류 발생: {str(e)[:50]}", (100, 200), 24, color=(0, 0, 255))
-            error_frame = put_text_pil(error_frame, "시스템을 재시작하세요", (100, 300), 24)
+    def _render_overlay(self, parking_lot, frame):
+        """감지 결과(주차면 다각형, 상태 정보 패널)를 그린 표시용 프레임 생성"""
+        # 화면 크기에 맞게 조정
+        display_frame = frame.copy()
+        height, width = display_frame.shape[:2]
 
-            self.current_frames[parking_lot] = error_frame
+        # 비율 유지하면서 너비 조정
+        display_height = int(height * self.display_width / width)
+        display_frame = cv2.resize(display_frame, (self.display_width, display_height))
 
-            # window_name이 유효한 경우에만 화면에 표시
-            if self.show_video and window_name and self.active_windows.get(parking_lot, False):
-                cv2.imshow(window_name, error_frame)
-                cv2.waitKey(3000)  # 3초간 오류 메시지 표시
-
-    def _display_frame(self, parking_lot, frame):
-        """감지 결과가 포함된 프레임을 화면에 표시 (개선된 버전)"""
-        try:
-            # 창 이름 가져오기
-            window_name = self.window_names.get(parking_lot)
-            if not window_name or not self.active_windows.get(parking_lot, False):
-                return  # 창이 비활성화되었거나 없으면 무시
-
-            # 화면 크기에 맞게 조정
-            display_frame = frame.copy()
-            height, width = display_frame.shape[:2]
-
-            # 비율 유지하면서 너비 조정
-            display_height = int(height * self.display_width / width)
-            display_frame = cv2.resize(display_frame, (self.display_width, display_height))
-
-            # 주차 공간 상태 표시
-            if parking_lot in self.parking_status:
-                status = self.parking_status[parking_lot]
-                spaces = PARKING_SPACES.get(parking_lot, [])
-
-                for space in spaces:
-                    space_id = space["id"]
-                    coords = np.array(space["coords"])
-
-                    # 비율에 맞게 좌표 조정
-                    scaled_coords = coords.copy()
-                    scaled_coords[:, 0] = coords[:, 0] * self.display_width / width
-                    scaled_coords[:, 1] = coords[:, 1] * display_height / height
-
-                    # 상태에 따른 색상 설정
-                    space_status = status.get(space_id, {}).get("status", "unknown")
-                    if space_status == "occupied":
-                        color = (0, 0, 255)  # 빨간색 (BGR)
-                        thickness = 3  # 두껍게 표시
-                    elif space_status == "empty":
-                        color = (0, 255, 0)  # 녹색 (BGR)
-                        thickness = 2
-                    else:
-                        color = (128, 128, 128)  # 회색 (BGR)
-                        thickness = 2
-
-                    # 다각형 그리기
-                    cv2.polylines(display_frame, [scaled_coords.astype(np.int32)], True, color, thickness)
-
-                    # 공간 ID 표시
-                    centroid = np.mean(scaled_coords, axis=0).astype(np.int32)
-                    # 배경 사각형 추가 (가독성 향상)
-                    text_size = cv2.getTextSize(space_id, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                    cv2.rectangle(display_frame,
-                                  (centroid[0] - text_size[0] // 2 - 5, centroid[1] - text_size[1] // 2 - 5),
-                                  (centroid[0] + text_size[0] // 2 + 5, centroid[1] + text_size[1] // 2 + 5),
-                                  (0, 0, 0), -1)
-
-                    cv2.putText(
-                        display_frame,
-                        space_id,
-                        (centroid[0] - text_size[0] // 2, centroid[1] + text_size[1] // 2),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA
-                    )
-
-            # 정보 패널 추가 (화면 상단)
-            info_panel_height = 60
-            info_panel = np.zeros((info_panel_height, self.display_width, 3), dtype=np.uint8)
-
-            # 전체 주차장 상태 정보 계산
+        # 주차 공간 상태 표시
+        with self.status_lock:
+            status = dict(self.parking_status.get(parking_lot, {}))
+        if status:
             spaces = PARKING_SPACES.get(parking_lot, [])
-            total_spaces = len(spaces)
-            occupied_spaces = sum(1 for s in self.parking_status.get(parking_lot, {}).values()
-                                  if s.get("status") == "occupied")
-            available_spaces = total_spaces - occupied_spaces
-            occupancy_rate = (occupied_spaces / total_spaces * 100) if total_spaces > 0 else 0
 
-            # 상태 문구와 색상 설정
-            if occupancy_rate > 80:
-                status_text = "매우 혼잡"
-                status_color = (0, 0, 255)  # 빨간색
-            elif occupancy_rate > 50:
-                status_text = "혼잡"
-                status_color = (0, 165, 255)  # 주황색
-            elif occupancy_rate > 30:
-                status_text = "보통"
-                status_color = (0, 255, 255)  # 노란색
-            else:
-                status_text = "여유"
-                status_color = (0, 255, 0)  # 녹색
+            for space in spaces:
+                space_id = space["id"]
+                coords = np.array(space["coords"])
 
-            # PIL로 정보 패널에 한글 텍스트 추가
-            info_text = f"주차 가능: {available_spaces}/{total_spaces} | 점유율: {occupancy_rate:.1f}% | 상태: {status_text}"
-            info_panel = put_text_pil(info_panel, info_text, (10, 20), 24, color=status_color)
+                # 비율에 맞게 좌표 조정
+                scaled_coords = coords.copy()
+                scaled_coords[:, 0] = coords[:, 0] * self.display_width / width
+                scaled_coords[:, 1] = coords[:, 1] * display_height / height
 
-            # 타임스탬프 표시
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            info_panel = put_text_pil(info_panel, timestamp, (self.display_width - 250, 20), 20, color=(255, 255, 255))
+                # 상태에 따른 색상 설정
+                space_status = status.get(space_id, {}).get("status", "unknown")
+                if space_status == "occupied":
+                    color = (0, 0, 255)  # 빨간색 (BGR)
+                    thickness = 3  # 두껍게 표시
+                elif space_status == "empty":
+                    color = (0, 255, 0)  # 녹색 (BGR)
+                    thickness = 2
+                else:
+                    color = (128, 128, 128)  # 회색 (BGR)
+                    thickness = 2
 
-            # 정보 패널과 화면 합치기
-            combined_frame = np.vstack((info_panel, display_frame))
+                # 다각형 그리기
+                cv2.polylines(display_frame, [scaled_coords.astype(np.int32)], True, color, thickness)
 
-            # 바닥 패널 추가 (키 안내)
-            bottom_panel_height = 40
-            bottom_panel = np.zeros((bottom_panel_height, self.display_width, 3), dtype=np.uint8)
-            bottom_panel = put_text_pil(
-                bottom_panel,
-                "창 닫기: 'q' | 일시정지: 'p' | 전체 종료: 'x'",
-                (10, 15), 20, color=(200, 200, 200)
-            )
+                # 공간 ID 표시
+                centroid = np.mean(scaled_coords, axis=0).astype(np.int32)
+                # 배경 사각형 추가 (가독성 향상)
+                text_size = cv2.getTextSize(space_id, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                cv2.rectangle(display_frame,
+                              (centroid[0] - text_size[0] // 2 - 5, centroid[1] - text_size[1] // 2 - 5),
+                              (centroid[0] + text_size[0] // 2 + 5, centroid[1] + text_size[1] // 2 + 5),
+                              (0, 0, 0), -1)
 
-            # 바닥 패널 추가
-            final_frame = np.vstack((combined_frame, bottom_panel))
+                cv2.putText(
+                    display_frame,
+                    space_id,
+                    (centroid[0] - text_size[0] // 2, centroid[1] + text_size[1] // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA
+                )
 
-            # 창 존재 확인 후 화면에 표시
-            try:
-                if window_name and self.active_windows.get(parking_lot, True):
-                    # OpenCV 창이 여전히 존재하는지 확인
-                    prop_val = cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE)
-                    if prop_val >= 0:  # 창이 존재하고 표시됨
-                        cv2.imshow(window_name, final_frame)
-                    else:
-                        # 창이 닫힌 경우
-                        logger.warning(f"창이 닫혔습니다: {window_name}")
-                        self.active_windows[parking_lot] = False
-            except Exception as e:
-                # 창이 닫혔거나 다른 오류 발생
-                logger.error(f"창 표시 중 오류: {e}")
-                self.active_windows[parking_lot] = False
+        # 정보 패널 추가 (화면 상단)
+        info_panel_height = 60
+        info_panel = np.zeros((info_panel_height, self.display_width, 3), dtype=np.uint8)
 
-        except Exception as e:
-            logger.error(f"화면 표시 중 오류 발생: {e}")
-            logger.error(traceback.format_exc())
+        # 전체 주차장 상태 정보 계산
+        spaces = PARKING_SPACES.get(parking_lot, [])
+        total_spaces = len(spaces)
+        occupied_spaces = sum(1 for st in status.values() if st.get("status") == "occupied")
+        available_spaces = total_spaces - occupied_spaces
+        occupancy_rate = (occupied_spaces / total_spaces * 100) if total_spaces > 0 else 0
+
+        # 상태 문구와 색상 설정
+        if occupancy_rate > 80:
+            status_text = "매우 혼잡"
+            status_color = (0, 0, 255)  # 빨간색
+        elif occupancy_rate > 50:
+            status_text = "혼잡"
+            status_color = (0, 165, 255)  # 주황색
+        elif occupancy_rate > 30:
+            status_text = "보통"
+            status_color = (0, 255, 255)  # 노란색
+        else:
+            status_text = "여유"
+            status_color = (0, 255, 0)  # 녹색
+
+        # PIL로 정보 패널에 한글 텍스트 추가
+        info_text = f"주차 가능: {available_spaces}/{total_spaces} | 점유율: {occupancy_rate:.1f}% | 상태: {status_text}"
+        info_panel = put_text_pil(info_panel, info_text, (10, 20), 24, color=status_color)
+
+        # 타임스탬프 표시
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        info_panel = put_text_pil(info_panel, timestamp, (self.display_width - 250, 20), 20, color=(255, 255, 255))
+
+        # 정보 패널과 화면 합치기
+        combined_frame = np.vstack((info_panel, display_frame))
+
+        # 바닥 패널 추가 (키 안내)
+        bottom_panel_height = 40
+        bottom_panel = np.zeros((bottom_panel_height, self.display_width, 3), dtype=np.uint8)
+        bottom_panel = put_text_pil(
+            bottom_panel,
+            "창 닫기(감지는 계속): 'q' | 일시정지: 'p' | 전체 종료: 'x'",
+            (10, 15), 20, color=(200, 200, 200)
+        )
+
+        # 바닥 패널 추가
+        final_frame = np.vstack((combined_frame, bottom_panel))
+
+        return final_frame
 
     def _detect_vehicles(self, frame, parking_lot, db_conn):
         """
         이미지에서 주차 공간 상태 감지 및 업데이트
-        B1 주차 영역 특별 처리 추가
+        (겹침 비율 × 신뢰도 점수 → 시간 필터 → 상태 전이 모델)
         """
         cursor = db_conn.cursor()
 
@@ -1053,13 +912,6 @@ class ParkingSystem:
         spaces = PARKING_SPACES.get(parking_lot, [])
         occupied_spaces = {}
         current_time = datetime.now()
-
-        # 시간적 필터 및 상태 전이 모델 초기화 (클래스에 멤버 추가)
-        if not hasattr(self, 'temporal_filters'):
-            self.temporal_filters = {}
-
-        if not hasattr(self, 'state_machines'):
-            self.state_machines = {}
 
         if parking_lot not in self.temporal_filters:
             self.temporal_filters[parking_lot] = {}
@@ -1129,43 +981,32 @@ class ParkingSystem:
             occupied_score = max([m[3] for m in mapping["occupied_mappings"]], default=0)
             empty_score = max([m[3] for m in mapping["empty_mappings"]], default=0)
 
-            # 전체 주차장 점유율 계산 (YOLO 모델 결과 기준)
-            total_detected = len(detected_empty) + len(detected_occupied)
-            expected_occupancy_rate = len(detected_occupied) / total_detected if total_detected > 0 else 0.5
-
-            # *** B1 주차 공간 특별 처리 강화 ***
-            is_b1_space = space_id == "B1"
+            # 55호관 B1은 카메라 가장자리에 걸쳐 차량이 잘려 보여 빈칸으로 오인되는 경우가 많아 별도 보정
+            is_b1_space = parking_lot == B1_CORRECTION_LOT and space_id == "B1"
 
             # 점유 객체 가중치 적용
             occupancy_boost = 1.3  # 기본 점유 가중치
 
-            # B1 주차 공간 특별 처리
             if is_b1_space:
-                # B1에 대한 가중치를 대폭 상향 (점유 상태 선호)
-                occupancy_boost = 2.5  # 2.0에서 2.5로 증가
-
-                # B1 위치에 대한 추가 점유 점수 부여 (최소 점수 보장)
-                occupied_score = max(occupied_score, 0.4)  # 모델이 전혀 감지하지 못해도 최소 0.4 점수 부여
-
-                # 비어있음 감지 신뢰도 감소
-                empty_score *= 0.6  # 40% 감소
-
-                # 디버깅 로그
+                # B1은 점유 상태를 선호하도록 가중치 상향
+                occupancy_boost = 2.5
+                # 모델이 전혀 감지하지 못해도 최소 0.4 점수 부여
+                occupied_score = max(occupied_score, 0.4)
+                # 비어있음 감지 신뢰도 40% 감소
+                empty_score *= 0.6
                 logger.debug(f"B1 공간 특별 처리: 점유={occupied_score:.2f}, 빈공간={empty_score:.2f}, 가중치={occupancy_boost}")
 
-            # 시간적 필터 초기화 및 적용
+            # 시간적 필터 초기화
             if space_id not in self.temporal_filters[parking_lot]:
-                # B1 주차 공간에 대해 특별 파라미터 적용
                 if is_b1_space:
                     self.temporal_filters[parking_lot][space_id] = self.TemporalFilter(
-                        history_length=25,  # 20에서 25로 증가
-                        occupancy_threshold=0.40,  # 0.45에서 0.40으로 감소 (더 쉽게 점유 상태로 판단)
-                        confidence_decay=0.98  # 0.97에서 0.98로 증가 (더 느린 감소율)
+                        history_length=25,
+                        occupancy_threshold=0.40,  # 더 쉽게 점유 상태로 판단
+                        confidence_decay=0.98  # 과거 판정을 더 오래 반영
                     )
                 else:
                     self.temporal_filters[parking_lot][space_id] = self._create_temporal_filter()
 
-            # 이 부분은 시뮬레이션으로, 실제 차량 감지 로직을 간소화하였습니다
             adjusted_occupied_score = occupied_score * occupancy_boost
 
             # 현재 프레임 상태 결정
@@ -1176,16 +1017,11 @@ class ParkingSystem:
                 current_frame_status = "empty"
                 confidence_score = empty_score
 
-            # B1 특별 처리 - 임계값 변경
-            if is_b1_space:
-                # B1이 빈 공간으로 판단되는 경우 추가 검증
-                if current_frame_status == "empty":
-                    # 빈 공간으로 판단하기 위한 임계값을 더 높게 설정
-                    if empty_score < 0.85:  # 매우 높은 신뢰도가 아니면
-                        # 점유 상태로 재설정
-                        current_frame_status = "occupied"
-                        confidence_score = max(occupied_score, 0.5)  # 최소 신뢰도 보장
-                        logger.debug(f"B1 공간 상태 오버라이드: 빈공간→점유 (신뢰도 부족: {empty_score:.2f})")
+            # B1: 빈칸 판정은 매우 높은 신뢰도(0.85 이상)일 때만 인정
+            if is_b1_space and current_frame_status == "empty" and empty_score < 0.85:
+                current_frame_status = "occupied"
+                confidence_score = max(occupied_score, 0.5)
+                logger.debug(f"B1 공간 상태 오버라이드: 빈공간→점유 (신뢰도 부족: {empty_score:.2f})")
 
             # 시간적 필터링 적용
             filtered_status, filtered_confidence = self.temporal_filters[parking_lot][space_id].update(
@@ -1194,12 +1030,11 @@ class ParkingSystem:
 
             # 상태 머신 초기화 및 적용
             if space_id not in self.state_machines[parking_lot]:
-                # B1 주차 공간에 대해 특별 파라미터 적용
                 if is_b1_space:
                     self.state_machines[parking_lot][space_id] = self.ParkingSpaceStateMachine(
-                        empty_to_occupied_threshold=1,  # 더 쉽게 점유 상태로 전환 (2→1)
-                        occupied_to_empty_threshold=15,  # 더 어렵게 빈 상태로 전환 (12→15)
-                        confidence_threshold=0.5  # 낮은 신뢰도도 수용 (0.55→0.5)
+                        empty_to_occupied_threshold=1,  # 더 쉽게 점유 상태로 전환
+                        occupied_to_empty_threshold=15,  # 더 어렵게 빈 상태로 전환
+                        confidence_threshold=0.5
                     )
                 else:
                     self.state_machines[parking_lot][space_id] = self._create_state_machine()
@@ -1209,24 +1044,17 @@ class ParkingSystem:
                 space_id, filtered_status, filtered_confidence
             )
 
-            # B1 주차 공간 수동 오버라이드 (필요한 경우)
-            if is_b1_space and final_status == "empty":
-                # 연속된 프레임에서 실제로 비어 있는지 확인하기 위한 추가 검증
-                # 이 경우 B1이 실제로 비어 있을 가능성이 높습니다
-                # 필요에 따라 수동 오버라이드를 주석 처리하거나 제거할 수 있습니다
-                if 'b1_empty_counter' not in self.__dict__:
-                    self.b1_empty_counter = 0
-
+            # B1: 상태 머신이 빈칸으로 판정해도 20회 연속일 때만 실제 빈칸으로 인정
+            if is_b1_space:
                 if final_status == "empty":
-                    self.b1_empty_counter += 1
+                    self.b1_empty_counters[parking_lot] = self.b1_empty_counters.get(parking_lot, 0) + 1
+                    if self.b1_empty_counters[parking_lot] < 20:
+                        final_status = "occupied"
+                        is_state_changed = False
+                        logger.debug(f"B1 공간 수동 오버라이드: empty→occupied "
+                                     f"(카운터: {self.b1_empty_counters[parking_lot]}/20)")
                 else:
-                    self.b1_empty_counter = 0
-
-                # 20프레임 이상 비어있음으로 감지되는 경우에만 실제로 비어있음으로 인정
-                if self.b1_empty_counter < 20:
-                    final_status = "occupied"  # 점유 상태로 오버라이드
-                    is_state_changed = False  # 상태 변경 플래그 재설정
-                    logger.debug(f"B1 공간 수동 오버라이드: empty→occupied (카운터: {self.b1_empty_counter}/20)")
+                    self.b1_empty_counters[parking_lot] = 0
 
             # 결과 기록
             occupied_spaces[space_id] = {
@@ -1237,170 +1065,22 @@ class ParkingSystem:
 
             # 상태가 변경된 경우만 데이터베이스 업데이트
             if is_state_changed:
-                self._update_space_status_in_db(cursor, space_id, final_status, current_time, db_conn)
+                self._update_space_status_in_db(cursor, parking_lot, space_id, final_status, current_time, db_conn)
 
         # 주차장 상태 업데이트
-        if parking_lot not in self.parking_status:
-            self.parking_status[parking_lot] = {}
+        with self.status_lock:
+            self.parking_status[parking_lot] = occupied_spaces
 
-        # 모든 주차 공간 정보 업데이트
-        self.parking_status[parking_lot] = occupied_spaces
-
-        # 전체 주차장 점유율 계산 및 DB에 기록
-        if parking_lot in self.parking_status:
-            total_spaces = len(PARKING_SPACES.get(parking_lot, []))
-            occupied_count = sum(1 for s in occupied_spaces.values() if s["status"] == "occupied")
-
-            if total_spaces > 0:
-                occupancy_rate = (occupied_count / total_spaces) * 100
-                # 5분마다 점유율 기록 (너무 자주 기록하지 않도록)
-                current_minute = datetime.now().minute
-                if current_minute % 5 == 0:
-                    self._record_occupancy_rate(parking_lot, occupancy_rate, db_conn)
+        # 전체 주차장 점유율을 5분 간격으로 DB에 기록 (시간대별 통계의 원천 데이터)
+        total_spaces = len(spaces)
+        if total_spaces > 0:
+            last_record = self.last_occupancy_record.get(parking_lot)
+            if last_record is None or current_time - last_record >= OCCUPANCY_RECORD_INTERVAL:
+                occupied_count = sum(1 for st in occupied_spaces.values() if st["status"] == "occupied")
+                self._record_occupancy_rate(parking_lot, (occupied_count / total_spaces) * 100, db_conn)
+                self.last_occupancy_record[parking_lot] = current_time
 
         return occupied_spaces
-
-    # 2. ParkingSpaceStateMachine 클래스의 update 메서드 수정 - B1 특별 처리
-    class ParkingSpaceStateMachine:
-        """
-        주차 공간 상태 변화를 모델링하는 상태 기계
-        이 클래스는 상태 전이에 제약을 두어 일시적인 오탐을 필터링합니다.
-        B1 주차 공간 특별 처리 추가
-        """
-
-        # 상태 정의
-        STATE_EMPTY = "empty"
-        STATE_OCCUPIED = "occupied"
-        STATE_TRANSITION_TO_EMPTY = "transition_to_empty"
-        STATE_TRANSITION_TO_OCCUPIED = "transition_to_occupied"
-
-        def __init__(self,
-                     empty_to_occupied_threshold=3,
-                     occupied_to_empty_threshold=3,
-                     confidence_threshold=0.6):
-            """
-            Args:
-                empty_to_occupied_threshold: 빈 상태에서 점유 상태로 전환하기 위한 연속 프레임 수
-                occupied_to_empty_threshold: 점유 상태에서 빈 상태로 전환하기 위한 연속 프레임 수
-                confidence_threshold: 상태 전환을 고려하기 위한 최소 신뢰도
-            """
-            self.empty_to_occupied_threshold = empty_to_occupied_threshold
-            self.occupied_to_empty_threshold = occupied_to_empty_threshold
-            self.confidence_threshold = confidence_threshold
-
-            # 공간별 상태 정보
-            self.space_states = {}
-
-        def update(self, space_id, detected_status, confidence):
-            """
-            주차 공간 상태 업데이트 및 필터링된 상태 반환
-
-            Args:
-                space_id: 주차 공간 ID
-                detected_status: 현재 프레임에서 감지된 상태 ('occupied' 또는 'empty')
-                confidence: 감지 신뢰도
-
-            Returns:
-                (filtered_status, is_state_changed): 필터링된 상태와 상태 변경 여부
-            """
-            # 공간 상태 초기화 (필요한 경우)
-            if space_id not in self.space_states:
-                self.space_states[space_id] = {
-                    'current_state': self.STATE_EMPTY,  # 기본값은 빈 상태
-                    'consecutive_occupied': 0,  # 연속으로 점유 감지된 프레임 수
-                    'consecutive_empty': 0,  # 연속으로 빈 상태로 감지된 프레임 수
-                    'last_stable_state': self.STATE_EMPTY,  # 마지막 안정 상태
-                    'last_confidence': 0.0  # 마지막 신뢰도
-                }
-
-            # 현재 상태 가져오기
-            state_info = self.space_states[space_id]
-            current_state = state_info['current_state']
-            is_state_changed = False
-
-            # B1 주차 공간 특별 처리
-            is_b1_space = space_id == "B1"
-            if is_b1_space:
-                # B1에 대한 신뢰도 임계값 낮춤
-                current_confidence_threshold = self.confidence_threshold * 0.8
-
-                # B1이 비어있는 것으로 감지된 경우 더 높은 신뢰도 요구
-                if detected_status == self.STATE_EMPTY:
-                    current_confidence_threshold = self.confidence_threshold * 1.3
-            else:
-                current_confidence_threshold = self.confidence_threshold
-
-            # 신뢰도가 임계값 이상인 경우에만 상태 업데이트 고려
-            if confidence >= current_confidence_threshold:
-                if detected_status == self.STATE_OCCUPIED:
-                    state_info['consecutive_occupied'] += 1
-                    state_info['consecutive_empty'] = 0
-                else:  # empty
-                    state_info['consecutive_empty'] += 1
-                    state_info['consecutive_occupied'] = 0
-
-            # B1 주차 공간 특별 처리 - 빈 상태로 전환하기 어렵게
-            if is_b1_space and current_state == self.STATE_OCCUPIED:
-                # B1이 점유 상태에서는 매우 높은 임계값 요구
-                occupied_to_empty_threshold = self.occupied_to_empty_threshold * 1.5
-            else:
-                occupied_to_empty_threshold = self.occupied_to_empty_threshold
-
-            # 상태 전이 로직
-            if current_state == self.STATE_EMPTY:
-                # B1 주차 공간 특별 처리 - 점유 상태로 쉽게 전환
-                if is_b1_space:
-                    threshold = max(1, self.empty_to_occupied_threshold // 2)
-                else:
-                    threshold = self.empty_to_occupied_threshold
-
-                if state_info['consecutive_occupied'] >= threshold:
-                    # 빈 상태 -> 점유 상태 전환
-                    state_info['current_state'] = self.STATE_OCCUPIED
-                    state_info['last_stable_state'] = self.STATE_OCCUPIED
-                    is_state_changed = True
-                    # 카운터 재설정
-                    state_info['consecutive_occupied'] = 0
-
-            elif current_state == self.STATE_OCCUPIED:
-                if state_info['consecutive_empty'] >= occupied_to_empty_threshold:
-                    # 점유 상태 -> 빈 상태 전환
-                    state_info['current_state'] = self.STATE_EMPTY
-                    state_info['last_stable_state'] = self.STATE_EMPTY
-                    is_state_changed = True
-                    # 카운터 재설정
-                    state_info['consecutive_empty'] = 0
-
-            # 전환 상태 처리
-            elif current_state == self.STATE_TRANSITION_TO_OCCUPIED:
-                if state_info['consecutive_occupied'] >= self.empty_to_occupied_threshold:
-                    state_info['current_state'] = self.STATE_OCCUPIED
-                    state_info['last_stable_state'] = self.STATE_OCCUPIED
-                    is_state_changed = True
-                elif state_info['consecutive_empty'] >= occupied_to_empty_threshold:
-                    state_info['current_state'] = self.STATE_EMPTY
-                    # 전환 취소
-
-            elif current_state == self.STATE_TRANSITION_TO_EMPTY:
-                if state_info['consecutive_empty'] >= occupied_to_empty_threshold:
-                    state_info['current_state'] = self.STATE_EMPTY
-                    state_info['last_stable_state'] = self.STATE_EMPTY
-                    is_state_changed = True
-                elif state_info['consecutive_occupied'] >= self.empty_to_occupied_threshold:
-                    state_info['current_state'] = self.STATE_OCCUPIED
-                    # 전환 취소
-
-            # 신뢰도 업데이트
-            state_info['last_confidence'] = confidence
-
-            # B1 주차 공간 디버깅 로그 (필요시 활성화)
-            if is_b1_space and is_state_changed:
-                logger.debug(f"B1 상태 변경: {state_info['last_stable_state']} → {state_info['current_state']}, "
-                             f"신뢰도: {confidence:.2f}, "
-                             f"연속 점유: {state_info['consecutive_occupied']}, "
-                             f"연속 빈공간: {state_info['consecutive_empty']}")
-
-            return state_info['current_state'], is_state_changed
 
     # 좌표 변환 유틸리티 함수
     def _convert_to_model_coordinates(self, coords, width_ratio, height_ratio):
@@ -1473,136 +1153,70 @@ class ParkingSystem:
                     score = overlap_ratio * confidence
                     mappings_list.append((i, overlap_ratio, confidence, score))
 
-    # 점유율 기록 기능 추가 (ParkingSystem 클래스 내부에 추가)
-    def _record_occupancy_rate(self, parking_lot, occupancy_rate, db_conn=None):
+    def _record_occupancy_rate(self, parking_lot, occupancy_rate, db_conn):
         """
-        주차장 점유율을 DB에 기록
-
-        Args:
-            parking_lot: 주차장 ID
-            occupancy_rate: 점유율 (0-100 사이 값)
-            db_conn: 데이터베이스 연결 (없으면 새로 생성)
+        주차장 점유율 샘플을 DB에 기록 (5분 간격으로 호출됨).
+        시간대별 통계는 같은 시간대 샘플들의 평균으로 계산한다.
         """
         try:
-            # DB 연결이 없으면 새로 생성
-            should_close_db = False
-            if db_conn is None:
-                db_conn = sqlite3.connect(self.db_path)
-                should_close_db = True
-
-            cursor = db_conn.cursor()
-
-            # 점유율 기록 테이블이 없으면 생성
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS occupancy_rates (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                parking_lot TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                hour INTEGER,
-                occupancy_rate REAL
-            )
-            ''')
-
-            # 현재 시간과 시간대
             current_time = datetime.now()
-            current_hour = current_time.hour
-
-            # 이미 같은 시간대에 기록이 있는지 확인
-            cursor.execute('''
-            SELECT id FROM occupancy_rates 
-            WHERE parking_lot = ? AND hour = ? AND 
-            date(timestamp) = date(?)
-            ''', (parking_lot, current_hour, current_time))
-
-            existing_record = cursor.fetchone()
-
-            if existing_record:
-                # 기존 기록 업데이트
-                cursor.execute('''
-                UPDATE occupancy_rates 
-                SET occupancy_rate = ?, timestamp = ?
-                WHERE id = ?
-                ''', (occupancy_rate, current_time, existing_record[0]))
-            else:
-                # 새 기록 추가
-                cursor.execute('''
-                INSERT INTO occupancy_rates 
-                (parking_lot, timestamp, hour, occupancy_rate)
-                VALUES (?, ?, ?, ?)
-                ''', (parking_lot, current_time, current_hour, occupancy_rate))
-
+            db_conn.execute(
+                "INSERT INTO occupancy_rates (parking_lot, timestamp, hour, occupancy_rate) VALUES (?, ?, ?, ?)",
+                (parking_lot, current_time.strftime("%Y-%m-%d %H:%M:%S"), current_time.hour, occupancy_rate)
+            )
             db_conn.commit()
-
-            # 필요한 경우 연결 종료
-            if should_close_db:
-                db_conn.close()
-
         except Exception as e:
             logger.error(f"점유율 기록 중 오류 발생: {e}")
             logger.error(traceback.format_exc())
-            if should_close_db and db_conn:
-                db_conn.close()
 
-    def _update_space_status_in_db(self, cursor, space_id, current_status, current_time, db_conn):
-        """주차 공간 상태 데이터베이스 업데이트"""
+    def _update_space_status_in_db(self, cursor, parking_lot, space_id, current_status, current_time, db_conn):
+        """주차 공간 상태 및 입출차 기록 데이터베이스 업데이트"""
         try:
-            # 현재 상태 조회
-            cursor.execute("SELECT status, last_updated FROM parking_spaces WHERE id = ?", (space_id,))
+            timestamp = current_time.strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute(
+                "SELECT status FROM parking_spaces WHERE parking_lot = ? AND id = ?",
+                (parking_lot, space_id)
+            )
             row = cursor.fetchone()
             previous_status = row[0] if row else "unknown"
-            last_updated = row[1] if row else None
 
-            # 상태가 변경된 경우에만 업데이트
-            if previous_status != current_status:
-                # 변경 로그 추가
-                logger.info(f"주차 공간 {space_id} 상태 변경: {previous_status} -> {current_status}")
+            if previous_status == current_status:
+                return False
 
-                # 주차 공간이 테이블에 없으면 추가
-                if not row:
+            logger.info(f"주차 공간 {parking_lot}/{space_id} 상태 변경: {previous_status} -> {current_status}")
+            cursor.execute(
+                "INSERT OR REPLACE INTO parking_spaces (parking_lot, id, status, last_updated) VALUES (?, ?, ?, ?)",
+                (parking_lot, space_id, current_status, timestamp)
+            )
+
+            # 점유됨으로 바뀌면 입차 기록 (최초 감지 시 이전 상태가 unknown인 경우 포함)
+            if current_status == "occupied":
+                cursor.execute(
+                    "SELECT id FROM vehicles WHERE parking_lot = ? AND parking_space_id = ? AND exit_time IS NULL",
+                    (parking_lot, space_id)
+                )
+                if not cursor.fetchone():
                     cursor.execute(
-                        "INSERT INTO parking_spaces (id, status, last_updated) VALUES (?, ?, ?)",
-                        (space_id, current_status, current_time)
+                        "INSERT INTO vehicles (parking_lot, parking_space_id, entry_time, vehicle_type) "
+                        "VALUES (?, ?, ?, ?)",
+                        (parking_lot, space_id, timestamp, "car")
                     )
-                    logger.info(f"새 주차 공간 {space_id} 추가, 초기 상태: {current_status}")
-                else:
-                    cursor.execute(
-                        "UPDATE parking_spaces SET status = ?, last_updated = ? WHERE id = ?",
-                        (current_status, current_time, space_id)
-                    )
+                    logger.info(f"차량 입차 기록: {parking_lot}/{space_id}, 시간 {timestamp}")
 
-                # 상태가 비어있음 -> 점유됨으로 변경된 경우 차량 입차 기록
-                if previous_status == "empty" and current_status == "occupied":
-                    # 이미 활성화된 입차 기록이 있는지 확인 (중복 방지)
-                    cursor.execute(
-                        "SELECT id FROM vehicles WHERE parking_space_id = ? AND exit_time IS NULL",
-                        (space_id,)
-                    )
-                    existing_entry = cursor.fetchone()
+            # 점유됨 -> 비어있음으로 바뀌면 출차 기록
+            elif current_status == "empty" and previous_status == "occupied":
+                cursor.execute(
+                    "UPDATE vehicles SET exit_time = ? "
+                    "WHERE parking_lot = ? AND parking_space_id = ? AND exit_time IS NULL",
+                    (timestamp, parking_lot, space_id)
+                )
 
-                    if not existing_entry:
-                        cursor.execute(
-                            "INSERT INTO vehicles (parking_space_id, entry_time, vehicle_type) VALUES (?, ?, ?)",
-                            (space_id, current_time, "car")
-                        )
-                        logger.info(f"차량 입차 기록: 주차 공간 {space_id}, 시간 {current_time}")
-                    else:
-                        logger.warning(f"주차 공간 {space_id}에 이미 활성화된 입차 기록이 있음 (중복 방지)")
-
-                # 상태가 점유됨 -> 비어있음으로 변경된 경우 차량 출차 기록
-                elif previous_status == "occupied" and current_status == "empty":
-                    # 출차 기록 업데이트
-                    cursor.execute(
-                        "UPDATE vehicles SET exit_time = ? WHERE parking_space_id = ? AND exit_time IS NULL",
-                        (current_time, space_id)
-                    )
-
-                db_conn.commit()
-                return True
+            db_conn.commit()
+            return True
 
         except Exception as e:
             logger.error(f"주차 공간 상태 업데이트 중 오류 발생: {e}")
             logger.error(traceback.format_exc())
-            # 트랜잭션 롤백
             db_conn.rollback()
 
         return False
@@ -1795,511 +1409,271 @@ class ParkingSystem:
 
             return state_info['current_state'], is_state_changed
 
-    # 주차장 상태 정보 반환 (Flask g 객체를 사용하도록 수정)
     def get_parking_status(self):
-        """주차장 상태 정보 반환"""
+        """주차장별 현재 상태 정보 반환"""
         status_result = {}
 
-        # 주차장별 상태 정보 수집
-        for parking_lot, spaces in self.parking_status.items():
-            total_spaces = len(PARKING_SPACES.get(parking_lot, []))
-            occupied_spaces = sum(1 for s in spaces.values() if s["status"] == "occupied")
-            available_spaces = total_spaces - occupied_spaces
+        with self.status_lock:
+            snapshot = {lot: dict(spaces) for lot, spaces in self.parking_status.items()}
 
-            # 모든 주차 공간 상태 정보 포함
-            spaces_details = []
-            for space_id, space_info in spaces.items():
-                spaces_details.append({
-                    "id": space_id,
-                    "status": space_info["status"],
-                    "vehicle_type": space_info["vehicle_type"]
-                })
+        for parking_lot in VIDEO_SOURCES.keys():
+            spaces = snapshot.get(parking_lot, {})
+            total_spaces = len(PARKING_SPACES.get(parking_lot, []))
+            occupied_spaces = sum(1 for st in spaces.values() if st["status"] == "occupied")
 
             status_result[parking_lot] = {
                 "total_spaces": total_spaces,
                 "occupied_spaces": occupied_spaces,
-                "available_spaces": available_spaces,
+                "available_spaces": total_spaces - occupied_spaces,
                 "occupancy_rate": round((occupied_spaces / total_spaces) * 100, 2) if total_spaces > 0 else 0,
-                "spaces": spaces_details
+                "spaces": [
+                    {"id": space_id, "status": info["status"], "vehicle_type": info["vehicle_type"]}
+                    for space_id, info in spaces.items()
+                ]
             }
-
-        # 주차장이 초기화되지 않은 경우 기본 정보 제공
-        for parking_lot in VIDEO_SOURCES.keys():
-            if parking_lot not in status_result:
-                total_spaces = len(PARKING_SPACES.get(parking_lot, []))
-                status_result[parking_lot] = {
-                    "total_spaces": total_spaces,
-                    "occupied_spaces": 0,
-                    "available_spaces": total_spaces,
-                    "occupancy_rate": 0,
-                    "spaces": []
-                }
 
         return status_result
 
-    # 주차장 통계 정보 반환 (Flask g 객체 사용)
-    def get_parking_statistics(self):
-        """주차장 통계 정보 반환"""
-        stats = {}
-
-        # Flask g 객체에서 데이터베이스 연결을 사용하도록 수정됨
-        # 이 메소드는 API 엔드포인트 내에서 호출되며, 그 엔드포인트에서 get_db()를 통해 연결을 제공함
-
-        return stats  # 실제 통계 데이터는 API 엔드포인트에서 채워짐
+    def _start_lot_thread(self, parking_lot, source):
+        thread = threading.Thread(
+            target=self._process_video_file,
+            args=(parking_lot, source),
+            name=f"video-{parking_lot}",
+            daemon=True
+        )
+        self.video_threads[parking_lot] = thread
+        thread.start()
+        logger.info(f"비디오 '{parking_lot}' 처리 스레드 시작")
 
     def start(self):
-        """모든 비디오 파일에서 차량 감지 시작"""
+        """모든 비디오 소스에서 차량 감지 시작"""
         if self.running:
             logger.info("이미 실행 중입니다")
             return
 
         self.running = True
-
-        # 각 비디오 소스에 대해 별도의 스레드 시작
         for parking_lot, source in VIDEO_SOURCES.items():
-            thread = threading.Thread(
-                target=self._process_video_file,
-                args=(parking_lot, source),
-                daemon=True
-            )
-            self.video_threads[parking_lot] = thread
-            thread.start()
-            logger.info(f"비디오 '{parking_lot}' 처리 스레드 시작")
+            self._start_lot_thread(parking_lot, source)
 
-    def stop(self):
-        """차량 감지 중지"""
+    def stop(self, timeout=10):
+        """차량 감지 중지 (처리 스레드가 실제로 종료될 때까지 대기)"""
         if not self.running:
             logger.info("이미 중지되었습니다")
             return
 
         self.running = False
-        time.sleep(1)  # 스레드 정상 종료 기다림
+        for parking_lot, thread in list(self.video_threads.items()):
+            if thread is not threading.current_thread():
+                thread.join(timeout=timeout)
+            if thread.is_alive():
+                logger.warning(f"스레드가 제한 시간 내에 종료되지 않았습니다: {parking_lot}")
+        self.video_threads.clear()
         logger.info("주차장 모니터링 중지됨")
 
-    # 비디오 소스 변경 메소드
-    def change_video_source(self, parking_lot, new_source):
-        """비디오 소스 변경
-
-        Args:
-            parking_lot (str): 주차장 ID
-            new_source (str): 새 비디오 소스 경로 (파일 또는 RTSP 스트림)
-
-        Returns:
-            bool: 성공 여부
-        """
-        try:
-            # 주차장 ID 확인
-            if parking_lot not in VIDEO_SOURCES:
-                logger.error(f"유효하지 않은 주차장 ID: {parking_lot}")
-                return False
-
-            logger.info(f"비디오 소스 변경 시도 - 주차장: {parking_lot}, 소스: {new_source}")
-
-            # 실행 중이었는지 기록
-            was_running = self.running
-
-            # 실행 중이면 일시 중지
-            if was_running:
-                self.stop()
-
-            # 비디오 소스 업데이트
-            old_source = VIDEO_SOURCES[parking_lot]
-            VIDEO_SOURCES[parking_lot] = new_source
-            logger.info(f"비디오 소스 변경: {old_source} -> {new_source}")
-
-            # 다시 시작
-            if was_running:
-                self.start()
-
-            return True
-
-        except Exception as e:
-            logger.error(f"비디오 소스 변경 중 예외 발생: {e}")
-            return False
-
-    # 새 주차장 추가 메소드
     def add_parking_lot(self, parking_lot_id, video_source, parking_spaces=None):
-        """새 주차장 추가
-
-        Args:
-            parking_lot_id (str): 주차장 ID
-            video_source (str): 비디오 소스 경로
-            parking_spaces (list): 주차 공간 좌표 목록 (없으면 빈 목록)
+        """
+        새 주차장 추가. 실행 중이면 해당 주차장 처리 스레드만 새로 시작한다.
 
         Returns:
             bool: 성공 여부
         """
-        try:
-            # 이미 존재하는 주차장인지 확인
-            if parking_lot_id in VIDEO_SOURCES:
-                logger.warning(f"이미 존재하는 주차장 ID: {parking_lot_id}")
-                return False
-
-            logger.info(f"새 주차장 추가: {parking_lot_id}, 소스: {video_source}")
-
-            # 실행 중이었는지 기록
-            was_running = self.running
-
-            # 실행 중이면 일시 중지
-            if was_running:
-                self.stop()
-
-            # 비디오 소스 및 주차 공간 추가
-            VIDEO_SOURCES[parking_lot_id] = video_source
-
-            # 주차 공간 좌표 추가 (제공된 경우)
-            if parking_spaces:
-                PARKING_SPACES[parking_lot_id] = parking_spaces
-            else:
-                # 빈 주차 공간 목록 추가
-                PARKING_SPACES[parking_lot_id] = []
-
-            # 주차장 상태 초기화
-            self.parking_status[parking_lot_id] = {}
-
-            # 다시 시작
-            if was_running:
-                self.start()
-
-            return True
-
-        except Exception as e:
-            logger.error(f"주차장 추가 중 예외 발생: {e}")
+        if parking_lot_id in VIDEO_SOURCES:
+            logger.warning(f"이미 존재하는 주차장 ID: {parking_lot_id}")
             return False
 
+        logger.info(f"새 주차장 추가: {parking_lot_id}, 소스: {video_source}")
+        VIDEO_SOURCES[parking_lot_id] = video_source
+        PARKING_SPACES[parking_lot_id] = parking_spaces or []
+        self.temporal_filters.pop(parking_lot_id, None)
+        self.state_machines.pop(parking_lot_id, None)
 
-# Flask 엔드포인트
+        if self.running:
+            self._start_lot_thread(parking_lot_id, video_source)
+        return True
+
+    def reset_lot_state(self, parking_lot_id):
+        """주차면 좌표가 바뀐 주차장의 필터/상태 초기화"""
+        self.temporal_filters.pop(parking_lot_id, None)
+        self.state_machines.pop(parking_lot_id, None)
+        with self.status_lock:
+            self.parking_status.pop(parking_lot_id, None)
+
+
+# ---------- 관리자 인증 ----------
+
+# 관리자 API 토큰. 환경 변수로 지정하지 않으면 서버 시작 시 임의 토큰을 생성해 로그에 출력한다.
+ADMIN_TOKEN = os.getenv('ADMIN_TOKEN')
+
+# 기본 제공 주차장 (삭제 API로 영상 처리를 중단하지 않음)
+BUILTIN_LOTS = ('parking_lot_A', 'parking_lot_B')
+
+
+def require_admin(f):
+    """X-Admin-Token 헤더가 관리자 토큰과 일치해야 호출 가능한 엔드포인트"""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        token = request.headers.get('X-Admin-Token', '')
+        if not ADMIN_TOKEN or not hmac.compare_digest(token.encode(), ADMIN_TOKEN.encode()):
+            return jsonify({"error": "관리자 인증이 필요합니다"}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def _valid_lot_id(lot_id):
+    return isinstance(lot_id, str) and 0 < len(lot_id) <= 64 and all(c.isalnum() or c in '_-' for c in lot_id)
+
+
+def normalize_spaces(spaces):
+    """주차면 좌표 목록 검증: [{"id": str, "coords": [[x, y], ...(3점 이상)]}, ...]"""
+    if not isinstance(spaces, list):
+        raise ValueError("좌표는 리스트여야 합니다")
+    normalized = []
+    seen = set()
+    for space in spaces:
+        if not isinstance(space, dict) or not isinstance(space.get('id'), str) or not space['id']:
+            raise ValueError("각 주차면은 문자열 id를 가져야 합니다")
+        coords = space.get('coords')
+        if not isinstance(coords, list) or len(coords) < 3:
+            raise ValueError(f"주차면 '{space['id']}'의 좌표는 3개 이상의 점이어야 합니다")
+        points = []
+        for point in coords:
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                raise ValueError(f"주차면 '{space['id']}'의 좌표 형식이 올바르지 않습니다")
+            points.append([int(point[0]), int(point[1])])
+        if space['id'] in seen:
+            raise ValueError(f"주차면 ID '{space['id']}'가 중복되었습니다")
+        seen.add(space['id'])
+        normalized.append({"id": space['id'], "coords": points})
+    return normalized
+
+
+# ---------- 공개 엔드포인트 ----------
+
+@app.route('/api/health', methods=['GET'])
+def health():
+    """가벼운 서버 상태 확인 (앱의 연결 확인용)"""
+    return jsonify({
+        "status": "ok",
+        "running": parking_system.running,
+        "parking_lots": list(VIDEO_SOURCES.keys())
+    })
+
+
+@app.route('/api/auth/check', methods=['GET'])
+@require_admin
+def auth_check():
+    """관리자 토큰 확인"""
+    return jsonify({"status": "ok"})
+
+
 @app.route('/api/status', methods=['GET'])
 def get_status():
     """현재 주차장 상태 반환"""
-    logger.info(f"API 요청 수신: /api/status - 클라이언트 IP: {request.remote_addr}")
-
     try:
-        status_result = parking_system.get_parking_status()
-        logger.info(f"API 응답 성공: /api/status")
-        return jsonify(status_result)
+        return jsonify(parking_system.get_parking_status())
     except Exception as e:
         logger.error(f"API 오류 발생: /api/status - {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "주차장 상태를 가져오는 중 오류가 발생했습니다"}), 500
 
 
-# 개선된 /api/statistics 엔드포인트 코드
-@app.route('/api/statistics', methods=['GET'])
-def get_statistics():
-    """개선된 주차장 통계 정보 반환 - 시간대별 점유율과 주차 추천 시간"""
-    try:
-        db = get_db()
-        cursor = db.cursor()
-
-        # 전체 주차 공간 수
-        total_spaces = 0
-        for parking_lot, spaces in PARKING_SPACES.items():
-            total_spaces += len(spaces)
-
-        # 주차 공간이 없는 경우에도 더미 데이터 제공 (오류 방지)
-        if total_spaces == 0:
-            logger.warning("주차 공간 정보가 없습니다. 더미 데이터를 사용합니다.")
-            # 더미 데이터 생성 함수 호출
-            return _generate_dummy_statistics()
-
-        # 현재 시간 (로컬 시간)
-        current_time = datetime.now()
-        current_hour = current_time.hour
-
-        # 현재 상태 조회 (오류 핸들링 추가)
-        current_status = parking_system.get_parking_status()
-
-        # 통계 계산용 변수 초기화
-        total_spaces = 0
-        current_occupied = 0  # 이 변수를 명시적으로 정의
-
-        # 모든 주차장의 합계 계산
-        for parking_lot, status in current_status.items():
-            total_spaces += status['total_spaces']
-            current_occupied += status['occupied_spaces']
-
-        # 현재 점유율 계산
-        current_occupancy_rate = round((current_occupied / total_spaces) * 100, 1) if total_spaces > 0 else 0
-
-        # 시간별 점유율 데이터 쿼리 (에러 핸들링 추가)
-        hourly_data = {}
-        try:
-            # 오늘 기록된 시간별 점유율 데이터 가져오기
-            cursor.execute(
-                """
-                SELECT 
-                    hour, 
-                    AVG(occupancy_rate) as avg_rate
-                FROM occupancy_rates 
-                WHERE date(timestamp) = date('now', 'localtime')
-                GROUP BY hour
-                ORDER BY hour
-                """
-            )
-            db_hourly_data = {row[0]: row[1] for row in cursor.fetchall()}
-
-            # 최근 7일 이용 패턴 정보 가져오기
-            cursor.execute(
-                """
-                SELECT 
-                    hour, 
-                    AVG(occupancy_rate) as avg_rate
-                FROM occupancy_rates 
-                WHERE timestamp >= datetime('now', '-7 days', 'localtime')
-                GROUP BY hour
-                ORDER BY hour
-                """
-            )
-            weekly_hourly_data = {row[0]: row[1] for row in cursor.fetchall()}
-
-            # 데이터가 정상적으로 조회되었으면 사용
-            hourly_data = db_hourly_data if db_hourly_data else weekly_hourly_data
-        except Exception as e:
-            logger.error(f"시간별 점유율 데이터 조회 중 오류 발생: {e}")
-            logger.error(traceback.format_exc())
-            # 오류 발생 시 빈 사전으로 초기화
-            hourly_data = {}
-
-        # 모의 데이터로 통계 보강 (실제 데이터가 부족한 경우)
-        hourly_occupancy_rate = {}
-
-        # 현재 시간 기준 패턴 생성 (아침/저녁 피크와 심야 시간대 감소 패턴)
-        morning_peak = [7, 8, 9]  # 아침 출근 시간
-        evening_peak = [17, 18, 19]  # 저녁 퇴근 시간
-        night_hours = [22, 23, 0, 1, 2, 3, 4, 5]  # 심야 시간
-
-        for hour in range(24):
-            # 기본 점유율 패턴 설정
-            base_rate = 50.0  # 기본 점유율
-
-            if hour in morning_peak:
-                # 아침 피크 시간
-                base_rate = 70.0 + (hour - 7) * 5  # 70-80% 점유율
-            elif hour in evening_peak:
-                # 저녁 피크 시간
-                base_rate = 75.0 + (hour - 17) * 5  # 75-85% 점유율
-            elif hour in night_hours:
-                # 심야 시간
-                if hour < 6:  # 0-5시
-                    base_rate = 20.0 + hour * 3  # 20-35% 점유율
-                else:  # 22-23시
-                    base_rate = 50.0 - (hour - 20) * 5  # 40-30% 점유율
-
-            # 약간의 랜덤성 추가 (±5%)
-            import random
-            variation = random.uniform(-5.0, 5.0)
-            simulated_rate = max(0, min(100, base_rate + variation))
-
-            # 실제 DB 데이터가 있으면 사용, 없으면 모의 데이터 사용
-            if hour in hourly_data:
-                rate = hourly_data[hour]
-            else:
-                # 현재 시간과 가까울수록 현재 점유율에 가까워지게 조정
-                hours_diff = min((hour - current_hour) % 24, (current_hour - hour) % 24)
-                weight = max(0, (24 - hours_diff) / 24)
-                rate = (simulated_rate * (1 - weight)) + (current_occupancy_rate * weight)
-
-            hourly_occupancy_rate[hour] = {
-                "rate": round(rate, 1),
-                "formatted": f"{round(rate)}%"
-            }
-
-            # 현재 시간 주변 시간대는 현실적인 값으로 조정
-            if hour == current_hour:
-                hourly_occupancy_rate[hour]["rate"] = current_occupancy_rate
-                hourly_occupancy_rate[hour]["formatted"] = f"{round(current_occupancy_rate)}%"
-
-        # 주차 추천 시간 계산 (현재 시간부터 향후 12시간 내에서 점유율이 가장 낮은 시간)
-        recommendation = {}
-
-        # 현재 시간부터 향후 12시간에 대해 점유율이 가장 낮은 시간 찾기
-        min_rate = 100
-        best_hour = current_hour
-
-        for offset in range(1, 13):  # 1시간 후부터 12시간 후까지
-            check_hour = (current_hour + offset) % 24
-            rate = hourly_occupancy_rate[check_hour]["rate"]
-
-            if rate < min_rate:
-                min_rate = rate
-                best_hour = check_hour
-
-        recommendation = {
-            "best_hour": best_hour,
-            "formatted_time": f"{best_hour:02d}:00",
-            "occupancy_rate": hourly_occupancy_rate[best_hour]["rate"],
-            "formatted_rate": hourly_occupancy_rate[best_hour]["formatted"]
-        }
-
-        # 시간대 구분 (아침, 점심, 저녁, 밤)
-        time_periods = {
-            "morning": {"start": 6, "end": 11, "label": "아침 (06:00-11:59)"},
-            "afternoon": {"start": 12, "end": 17, "label": "오후 (12:00-17:59)"},
-            "evening": {"start": 18, "end": 21, "label": "저녁 (18:00-21:59)"},
-            "night": {"start": 22, "end": 5, "label": "밤 (22:00-05:59)"}
-        }
-
-        period_rates = {}
-        for period_name, period_info in time_periods.items():
-            start = period_info["start"]
-            end = period_info["end"]
-
-            period_hours = []
-            if start <= end:
-                period_hours = list(range(start, end + 1))
-            else:  # 밤처럼 날짜를 넘어가는 경우
-                period_hours = list(range(start, 24)) + list(range(0, end + 1))
-
-            total_rate = 0
-            for h in period_hours:
-                total_rate += hourly_occupancy_rate[h]["rate"]
-
-            avg_rate = round(total_rate / len(period_hours), 1)
-            period_rates[period_name] = {
-                "label": period_info["label"],
-                "avg_rate": avg_rate,
-                "formatted_rate": f"{avg_rate}%"
-            }
-
-        # 결과 포맷팅
-        hourly_data_list = []
-        for hour in range(24):
-            hourly_data_list.append({
-                "hour": hour,
-                "formatted_time": f"{hour:02d}:00",
-                "occupancy_rate": hourly_occupancy_rate[hour]["rate"],
-                "formatted_rate": hourly_occupancy_rate[hour]["formatted"],
-                "is_current": hour == current_hour
-            })
-
-        # 결과 조합
-        stats = {
-            "current": {
-                "time": current_time.strftime("%H:%M"),
-                "hour": current_hour,
-                "occupancy_rate": current_occupancy_rate,
-                "formatted_rate": f"{current_occupancy_rate}%",
-                "total_spaces": total_spaces,
-                "occupied_spaces": current_occupied,
-                "available_spaces": total_spaces - current_occupied
-            },
-            "hourly_data": hourly_data_list,
-            "recommendation": recommendation,
-            "time_periods": period_rates
-        }
-
-        logger.info(
-            f"통계 API 응답: 현재 점유율 {current_occupancy_rate}%, "
-            f"추천 시간 {recommendation['formatted_time']} ({recommendation['formatted_rate']})"
-        )
-
-        return jsonify(stats)
-
-    except Exception as e:
-        logger.error(f"통계 정보 조회 중 오류 발생: {e}")
-        logger.error(traceback.format_exc())
-        # 오류 시 더미 데이터 반환
-        return _generate_dummy_statistics()
+TIME_PERIODS = {
+    "morning": {"start": 6, "end": 11, "label": "아침 (06:00-11:59)"},
+    "afternoon": {"start": 12, "end": 17, "label": "오후 (12:00-17:59)"},
+    "evening": {"start": 18, "end": 21, "label": "저녁 (18:00-21:59)"},
+    "night": {"start": 22, "end": 5, "label": "밤 (22:00-05:59)"}
+}
 
 
-# 더미 통계 데이터 생성 (백엔드 오류 시 사용)
-def _generate_dummy_statistics():
-    """기본 통계 데이터 생성 (오류 발생 시 반환용)"""
-    logger.info("더미 통계 데이터를 생성합니다")
+def _hourly_averages(cursor, lot_ids, period_condition):
+    """시간대별 평균 점유율과 샘플 수 조회"""
+    placeholders = ','.join('?' for _ in lot_ids)
+    cursor.execute(
+        f"""
+        SELECT hour, AVG(occupancy_rate), COUNT(*)
+        FROM occupancy_rates
+        WHERE parking_lot IN ({placeholders}) AND {period_condition}
+        GROUP BY hour
+        """,
+        tuple(lot_ids)
+    )
+    return {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
 
-    # 현재 시간
+
+def build_statistics(lot_ids):
+    """
+    DB에 누적된 5분 간격 점유율 샘플로 시간대별 통계를 계산한다.
+    각 시간대는 당일 평균을 우선 사용하고, 없으면 최근 7일 평균을 사용한다.
+    데이터가 없는 시간대는 임의 값으로 채우지 않고 has_data=false로 표시한다.
+    """
+    cursor = get_db().cursor()
     current_time = datetime.now()
     current_hour = current_time.hour
 
-    # 기본 주차장 정보
-    total_spaces = 100
-    current_occupied = 50  # 여기에 변수 정의 추가
-    current_occupancy_rate = 50.0
+    # 현재 상태 (실시간)
+    current_status = parking_system.get_parking_status()
+    total_spaces = sum(current_status[lot]['total_spaces'] for lot in lot_ids if lot in current_status)
+    current_occupied = sum(current_status[lot]['occupied_spaces'] for lot in lot_ids if lot in current_status)
+    has_live_data = parking_system.running and any(
+        current_status.get(lot, {}).get('spaces') for lot in lot_ids
+    )
+    current_occupancy_rate = round((current_occupied / total_spaces) * 100, 1) if total_spaces > 0 else 0.0
 
-    # 시간별 점유율 데이터 생성
-    hourly_data_list = []
-    hourly_occupancy_rate = {}
+    today = _hourly_averages(cursor, lot_ids, "date(timestamp) = date('now', 'localtime')")
+    week = _hourly_averages(cursor, lot_ids, "timestamp >= datetime('now', 'localtime', '-7 days')")
 
-    # 시간대별 패턴 (아침/저녁 피크, 심야 낮음)
+    hourly = {}
     for hour in range(24):
-        # 기본 점유율 패턴
-        if hour >= 7 and hour <= 9:  # 아침 출근 시간
-            rate = 70.0 + (hour - 7) * 5  # 70-85%
-        elif hour >= 17 and hour <= 19:  # 저녁 퇴근 시간
-            rate = 75.0 + (hour - 17) * 5  # 75-85%
-        elif hour >= 22 or hour <= 5:  # 심야 시간
-            rate = 30.0  # 30%
-        else:  # 그 외 시간
-            rate = 50.0  # 50%
+        if hour == current_hour and has_live_data:
+            rate, source, samples = current_occupancy_rate, "live", None
+        elif hour in today:
+            rate, source, samples = today[hour][0], "today", today[hour][1]
+        elif hour in week:
+            rate, source, samples = week[hour][0], "week", week[hour][1]
+        else:
+            rate, source, samples = None, None, 0
+        hourly[hour] = {"rate": None if rate is None else round(rate, 1), "source": source, "samples": samples}
 
-        # 약간의 무작위성 추가
-        import random
-        rate += random.uniform(-5.0, 5.0)
-        rate = max(0, min(100, rate))
-        rate = round(rate, 1)
+    hourly_data_list = [{
+        "hour": hour,
+        "formatted_time": f"{hour:02d}:00",
+        "occupancy_rate": hourly[hour]["rate"] if hourly[hour]["rate"] is not None else 0.0,
+        "formatted_rate": f"{round(hourly[hour]['rate'])}%" if hourly[hour]["rate"] is not None else "-",
+        "has_data": hourly[hour]["rate"] is not None,
+        "source": hourly[hour]["source"],
+        "sample_count": hourly[hour]["samples"],
+        "is_current": hour == current_hour
+    } for hour in range(24)]
 
-        # 현재 시간이면 기본 점유율 사용
-        if hour == current_hour:
-            rate = current_occupancy_rate
-
-        hourly_data_list.append({
-            "hour": hour,
-            "formatted_time": f"{hour:02d}:00",
-            "occupancy_rate": rate,
-            "formatted_rate": f"{round(rate)}%",
-            "is_current": hour == current_hour
-        })
-
-        hourly_occupancy_rate[hour] = {
-            "rate": rate,
-            "formatted": f"{round(rate)}%"
-        }
-
-    # 추천 시간 (가장 낮은 점유율 시간)
-    min_rate = 100
-    best_hour = 4  # 기본값
-
-    # 현재 시간부터 12시간 내에서 점유율이 가장 낮은 시간 찾기
+    # 추천 시간: 향후 12시간 중 데이터가 있는 시간대에서 점유율이 가장 낮은 시간
+    recommendation = None
     for offset in range(1, 13):
         check_hour = (current_hour + offset) % 24
-        rate = hourly_occupancy_rate[check_hour]["rate"]
-        if rate < min_rate:
-            min_rate = rate
-            best_hour = check_hour
+        rate = hourly[check_hour]["rate"]
+        if rate is not None and (recommendation is None or rate < recommendation["occupancy_rate"]):
+            recommendation = {
+                "best_hour": check_hour,
+                "formatted_time": f"{check_hour:02d}:00",
+                "occupancy_rate": rate,
+                "formatted_rate": f"{round(rate)}%"
+            }
 
-    recommendation = {
-        "best_hour": best_hour,
-        "formatted_time": f"{best_hour:02d}:00",
-        "occupancy_rate": hourly_occupancy_rate[best_hour]["rate"],
-        "formatted_rate": hourly_occupancy_rate[best_hour]["formatted"]
-    }
-
-    # 시간대별 평균 점유율
-    period_rates = {
-        "morning": {
-            "label": "아침 (06:00-11:59)",
-            "avg_rate": 65.0,
-            "formatted_rate": "65%"
-        },
-        "afternoon": {
-            "label": "오후 (12:00-17:59)",
-            "avg_rate": 70.0,
-            "formatted_rate": "70%"
-        },
-        "evening": {
-            "label": "저녁 (18:00-21:59)",
-            "avg_rate": 60.0,
-            "formatted_rate": "60%"
-        },
-        "night": {
-            "label": "밤 (22:00-05:59)",
-            "avg_rate": 30.0,
-            "formatted_rate": "30%"
+    # 시간대 구분 (아침, 오후, 저녁, 밤) 평균
+    period_rates = {}
+    for period_name, info in TIME_PERIODS.items():
+        if info["start"] <= info["end"]:
+            period_hours = range(info["start"], info["end"] + 1)
+        else:  # 밤처럼 날짜를 넘어가는 경우
+            period_hours = list(range(info["start"], 24)) + list(range(0, info["end"] + 1))
+        rates = [hourly[h]["rate"] for h in period_hours if hourly[h]["rate"] is not None]
+        avg_rate = round(sum(rates) / len(rates), 1) if rates else None
+        period_rates[period_name] = {
+            "label": info["label"],
+            "avg_rate": avg_rate if avg_rate is not None else 0.0,
+            "formatted_rate": f"{avg_rate}%" if avg_rate is not None else "-",
+            "has_data": avg_rate is not None
         }
-    }
 
-    # 결과 조합
-    stats = {
+    return {
         "current": {
             "time": current_time.strftime("%H:%M"),
             "hour": current_hour,
@@ -2307,69 +1681,104 @@ def _generate_dummy_statistics():
             "formatted_rate": f"{current_occupancy_rate}%",
             "total_spaces": total_spaces,
             "occupied_spaces": current_occupied,
-            "available_spaces": total_spaces - current_occupied
+            "available_spaces": total_spaces - current_occupied,
+            "is_live": has_live_data
         },
         "hourly_data": hourly_data_list,
         "recommendation": recommendation,
-        "time_periods": period_rates
+        "time_periods": period_rates,
+        "data_coverage": {
+            "hours_with_data": sum(1 for h in hourly.values() if h["rate"] is not None),
+            "today_hours": len(today),
+            "week_hours": len(week)
+        }
     }
 
-    return jsonify(stats)
+
+@app.route('/api/statistics', methods=['GET'])
+def get_statistics():
+    """전체 주차장 통계 (시간대별 점유율과 추천 시간)"""
+    try:
+        return jsonify(build_statistics(list(VIDEO_SOURCES.keys())))
+    except Exception as e:
+        logger.error(f"통계 정보 조회 중 오류 발생: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": "통계 정보를 가져오는 중 오류가 발생했습니다"}), 500
+
+
+@app.route('/api/statistics/<parking_lot_id>', methods=['GET'])
+def get_parking_lot_statistics(parking_lot_id):
+    """특정 주차장의 통계 정보 반환"""
+    try:
+        if parking_lot_id not in VIDEO_SOURCES:
+            if parking_lot_id not in PARKING_SPACES:
+                return jsonify({"error": f"주차장 '{parking_lot_id}'를 찾을 수 없습니다"}), 404
+            # 좌표만 있고 영상이 연결되지 않은 주차장
+            return jsonify({
+                "parking_lot_id": parking_lot_id,
+                "has_video": False,
+                "message": "아직 영상이 연결되지 않은 주차장입니다",
+                "total_spaces": len(PARKING_SPACES.get(parking_lot_id, [])),
+            })
+
+        stats = build_statistics([parking_lot_id])
+        stats.update({"parking_lot_id": parking_lot_id, "has_video": True})
+        return jsonify(stats)
+
+    except Exception as e:
+        logger.error(f"주차장 '{parking_lot_id}' 통계 조회 중 오류: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": "통계 정보를 가져오는 중 오류가 발생했습니다"}), 500
+
 
 @app.route('/api/history', methods=['GET'])
 def get_history():
-    """주차 이력 반환"""
+    """주차 이력 반환 (days: 조회 기간, parking_lot: 주차장 필터)"""
     try:
-        days = request.args.get('days', default=7, type=int)
+        days = max(1, min(request.args.get('days', default=7, type=int), 365))
+        parking_lot = request.args.get('parking_lot')
 
-        db = get_db()
-        cursor = db.cursor()
-
-        # 로컬 시간 적용하여 이력 조회
-        cursor.execute(
-            """
-            SELECT 
-                id, 
-                parking_space_id, 
-                entry_time, 
-                exit_time, 
-                vehicle_type
+        query = """
+            SELECT id, parking_lot, parking_space_id, entry_time, exit_time, vehicle_type
             FROM vehicles
-            WHERE entry_time >= datetime('now', '-' || ? || ' days', 'localtime')
-            ORDER BY entry_time DESC
-            """,
-            (days,)
-        )
+            WHERE entry_time >= datetime('now', 'localtime', ?)
+        """
+        params = [f'-{days} days']
+        if parking_lot:
+            query += " AND parking_lot = ?"
+            params.append(parking_lot)
+        query += " ORDER BY entry_time DESC"
+
+        cursor = get_db().cursor()
+        cursor.execute(query, params)
 
         history = []
-        for row in cursor.fetchall():
-            vehicle_id, space_id, entry_time, exit_time, vehicle_type = row
+        for vehicle_id, lot_id, space_id, entry_time, exit_time, vehicle_type in cursor.fetchall():
             duration = None
             duration_seconds = None
 
             if entry_time and exit_time:
                 try:
-                    entry_dt = datetime.fromisoformat(entry_time.replace(' ', 'T'))
-                    exit_dt = datetime.fromisoformat(exit_time.replace(' ', 'T'))
+                    entry_dt = datetime.fromisoformat(str(entry_time).replace(' ', 'T'))
+                    exit_dt = datetime.fromisoformat(str(exit_time).replace(' ', 'T'))
                     duration_seconds = (exit_dt - entry_dt).total_seconds()
 
-                    # 유효한 시간인지 확인 (음수 시간 또는 24시간 초과 체크)
                     if duration_seconds < 0:
                         duration = "오류: 음수 시간"
                         logger.warning(f"음수 주차 시간 감지: 차량 ID {vehicle_id}, 주차 공간 {space_id}")
-                    elif duration_seconds > 86400:  # 24시간(86400초) 초과
+                    elif duration_seconds > 86400:  # 24시간 초과
                         duration = f"{int(duration_seconds // 86400)}일 {int((duration_seconds % 86400) // 3600)}시간"
-                        logger.info(f"장기 주차 감지: 차량 ID {vehicle_id}, 주차 공간 {space_id}, 시간 {duration}")
                     else:
                         hours = int(duration_seconds // 3600)
                         minutes = int((duration_seconds % 3600) // 60)
                         duration = f"{hours}시간 {minutes}분"
-                except Exception as e:
+                except ValueError as e:
                     duration = "시간 형식 오류"
                     logger.error(f"주차 시간 계산 오류: {e}, 입차: {entry_time}, 출차: {exit_time}")
 
             history.append({
                 "id": vehicle_id,
+                "parking_lot": lot_id,
                 "space_id": space_id,
                 "entry_time": entry_time,
                 "exit_time": exit_time,
@@ -2383,10 +1792,13 @@ def get_history():
     except Exception as e:
         logger.error(f"주차 이력 조회 중 오류 발생: {e}")
         logger.error(traceback.format_exc())
-        return jsonify({"error": "주차 이력을 가져오는 중 오류가 발생했습니다", "message": str(e)}), 500
+        return jsonify({"error": "주차 이력을 가져오는 중 오류가 발생했습니다"}), 500
 
+
+# ---------- 관리자 엔드포인트 ----------
 
 @app.route('/api/start', methods=['POST'])
+@require_admin
 def start_system():
     """시스템 시작"""
     parking_system.start()
@@ -2394,24 +1806,23 @@ def start_system():
 
 
 @app.route('/api/stop', methods=['POST'])
+@require_admin
 def stop_system():
     """시스템 중지"""
     parking_system.stop()
     return jsonify({"status": "stopped"})
 
 
-# 디버깅을 위한 추가 엔드포인트
 @app.route('/api/debug', methods=['GET'])
+@require_admin
 def debug_info():
     """시스템 디버그 정보 반환"""
-    # 모델 정보
     model_info = {
         "path": MODEL_PATH,
         "exists": os.path.exists(MODEL_PATH),
         "size": os.path.getsize(MODEL_PATH) if os.path.exists(MODEL_PATH) else None
     }
 
-    # 비디오 파일 정보
     video_info = {}
     for name, path in VIDEO_SOURCES.items():
         video_info[name] = {
@@ -2420,28 +1831,20 @@ def debug_info():
             "size": os.path.getsize(path) if os.path.exists(path) else None
         }
 
-    # 데이터베이스 정보
     db_info = {}
     try:
-        db = get_db()
-        cursor = db.cursor()
-
-        # 테이블 정보 수집
+        cursor = get_db().cursor()
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = cursor.fetchall()
-
+        tables = [table[0] for table in cursor.fetchall()]
         db_info = {
             "path": DB_PATH,
             "exists": os.path.exists(DB_PATH),
             "size": os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else None,
-            "tables": [table[0] for table in tables]
+            "tables": tables
         }
-
-        # 각 테이블의 행 수 추가
-        for table in db_info["tables"]:
-            cursor.execute(f"SELECT COUNT(*) FROM {table}")
+        for table in tables:
+            cursor.execute(f'SELECT COUNT(*) FROM "{table}"')
             db_info[f"{table}_count"] = cursor.fetchone()[0]
-
     except Exception as e:
         db_info["error"] = str(e)
 
@@ -2455,36 +1858,27 @@ def debug_info():
 
 
 @app.route('/api/test_model', methods=['GET'])
+@require_admin
 def test_model():
-    """모델 테스트 결과 반환 (YOLOv8용)"""
+    """모델 동작 확인"""
     try:
-        # 테스트 이미지 생성 (또는 로드)
         test_img = np.zeros((640, 640, 3), dtype=np.uint8)
         cv2.rectangle(test_img, (100, 100), (300, 400), (0, 255, 0), 3)
-
-        # 모델 테스트
         results = parking_system.model(test_img)
-
-        # 모델 정보 수집
-        model_info = {
-            "path": MODEL_PATH,
-            "exists": os.path.exists(MODEL_PATH),
-            "size": os.path.getsize(MODEL_PATH) if os.path.exists(MODEL_PATH) else None,
-            "task": parking_system.model.task if hasattr(parking_system.model, 'task') else "unknown",
-            "names": parking_system.model.names if hasattr(parking_system.model, 'names') else None,
-        }
 
         return jsonify({
             "status": "success",
-            "model_info": model_info,
+            "model_info": {
+                "path": MODEL_PATH,
+                "task": getattr(parking_system.model, 'task', "unknown"),
+                "names": getattr(parking_system.model, 'names', None),
+            },
             "detection_count": len(results[0]) if results else 0
         })
     except Exception as e:
-        return jsonify({
-            "status": "error",
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        })
+        logger.error(f"모델 테스트 실패: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({"status": "error", "error": "모델 테스트 중 오류가 발생했습니다"}), 500
 
 
 # 비디오 스트림 API 엔드포인트
@@ -2552,7 +1946,6 @@ def stream_video(parking_lot):
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
-# 주차장 관리 API 엔드포인트
 @app.route('/api/parking_lots', methods=['GET'])
 def get_parking_lots():
     """등록된 주차장 목록 반환"""
@@ -2615,6 +2008,7 @@ def get_parking_lots():
 
 
 @app.route('/api/parking_lots', methods=['POST'])
+@require_admin
 def add_parking_lot():
     """새 주차장 추가"""
     try:
@@ -2689,6 +2083,7 @@ def add_parking_lot():
 
 
 @app.route('/api/parking_lots/<lot_id>', methods=['PUT'])
+@require_admin
 def update_parking_lot(lot_id):
     """주차장 정보 업데이트"""
     try:
@@ -2768,6 +2163,7 @@ def update_parking_lot(lot_id):
 
 
 @app.route('/api/parking_lots/<lot_id>', methods=['DELETE'])
+@require_admin
 def delete_parking_lot(lot_id):
     """주차장 삭제"""
     try:
@@ -2785,6 +2181,13 @@ def delete_parking_lot(lot_id):
         # 주차장 삭제
         cursor.execute('DELETE FROM parking_lots WHERE id = ?', (lot_id,))
 
+        # 동적으로 추가한 주차장이면 영상 처리도 중단 (처리 루프가 VIDEO_SOURCES에서 빠진 것을 감지하고 종료)
+        if lot_id not in BUILTIN_LOTS:
+            cursor.execute('DELETE FROM parking_space_polygons WHERE parking_lot_id = ?', (lot_id,))
+            VIDEO_SOURCES.pop(lot_id, None)
+            PARKING_SPACES.pop(lot_id, None)
+            parking_system.reset_lot_state(lot_id)
+
         db.commit()
 
         return jsonify({
@@ -2798,85 +2201,117 @@ def delete_parking_lot(lot_id):
         return jsonify({"error": str(e)}), 500
 
 
-# 동적 주차장 관리를 위한 새로운 API 엔드포인트 추가
+# 동적 주차장 관리
 @app.route('/api/parking_lots/dynamic', methods=['POST'])
+@require_admin
 def add_dynamic_parking_lot():
-    """동적으로 새 주차장 추가 (비디오 파일과 좌표 포함)"""
+    """
+    영상이 연결된 주차장을 동적으로 추가.
+    video_path는 VIDEOS_DIR 안의 파일 또는 rtsp/http 스트림 URL만 허용한다.
+    coordinates는 비워 두고 나중에 좌표 파일 업로드 API로 설정할 수 있다.
+    """
     try:
-        if not request.json:
+        lot_data = request.get_json(silent=True)
+        if not lot_data:
             return jsonify({"error": "요청 본문이 JSON 형식이어야 합니다"}), 400
 
-        lot_data = request.json
-
-        # 필수 필드 검증
-        required_fields = ['id', 'name', 'video_path', 'coordinates']
-        for field in required_fields:
+        for field in ['id', 'name', 'video_path']:
             if field not in lot_data:
                 return jsonify({"error": f"필수 필드 '{field}'가 누락되었습니다"}), 400
 
         parking_lot_id = lot_data['id']
-        video_path = lot_data['video_path']
-        coordinates = lot_data['coordinates']
+        if not _valid_lot_id(parking_lot_id):
+            return jsonify({"error": "주차장 ID는 영문, 숫자, '_', '-'로 이루어진 64자 이하 문자열이어야 합니다"}), 400
 
-        # 비디오 파일 존재 확인
-        if not os.path.exists(video_path):
-            return jsonify({"error": f"비디오 파일을 찾을 수 없습니다: {video_path}"}), 400
-
-        # 주차장 ID 중복 확인
         if parking_lot_id in VIDEO_SOURCES:
             return jsonify({"error": f"주차장 ID '{parking_lot_id}'가 이미 존재합니다"}), 409
 
-        # 좌표 형식 검증
-        if not isinstance(coordinates, list) or len(coordinates) == 0:
-            return jsonify({"error": "좌표는 빈 배열이 아닌 리스트여야 합니다"}), 400
-
-        # 주차장 동적 추가
-        success = parking_system.add_parking_lot(parking_lot_id, video_path, coordinates)
-
-        if success:
-            # 데이터베이스에도 저장
-            db = get_db()
-            cursor = db.cursor()
-
-            cursor.execute('''
-            INSERT INTO parking_lots (
-                id, name, building, latitude, longitude, capacity, 
-                type, has_disabled_spaces, open_hours, description, video_source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                parking_lot_id,
-                lot_data.get('name', f'주차장 {parking_lot_id}'),
-                lot_data.get('building', ''),
-                lot_data.get('latitude', 0.0),
-                lot_data.get('longitude', 0.0),
-                len(coordinates),
-                lot_data.get('type', 'outdoor'),
-                1 if lot_data.get('hasDisabledSpaces', False) else 0,
-                lot_data.get('openHours', '24시간'),
-                lot_data.get('description', ''),
-                video_path
-            ))
-
-            db.commit()
-
+        video_source = resolve_video_source(lot_data['video_path'])
+        if not video_source:
             return jsonify({
-                "status": "success",
-                "message": f"주차장 '{parking_lot_id}'가 성공적으로 추가되었습니다",
-                "parking_lot_id": parking_lot_id,
-                "total_spaces": len(coordinates)
-            }), 201
-        else:
-            return jsonify({"error": "주차장 추가에 실패했습니다"}), 500
+                "error": "영상 소스를 사용할 수 없습니다. 서버의 videos 디렉터리 안에 있는 파일 이름 또는 "
+                         "rtsp/http 스트림 주소를 입력하세요"
+            }), 400
+
+        try:
+            coordinates = normalize_spaces(lot_data.get('coordinates') or [])
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+
+        db = get_db()
+        db.execute('''
+        INSERT INTO parking_lots (
+            id, name, building, latitude, longitude, capacity,
+            type, has_disabled_spaces, open_hours, description, video_source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            video_source = excluded.video_source,
+            capacity = excluded.capacity,
+            updated_at = CURRENT_TIMESTAMP
+        ''', (
+            parking_lot_id,
+            lot_data.get('name', f'주차장 {parking_lot_id}'),
+            lot_data.get('building', ''),
+            lot_data.get('latitude', 0.0),
+            lot_data.get('longitude', 0.0),
+            len(coordinates),
+            lot_data.get('type', 'outdoor'),
+            1 if lot_data.get('hasDisabledSpaces', False) else 0,
+            lot_data.get('openHours', '24시간'),
+            lot_data.get('description', ''),
+            video_source
+        ))
+        save_space_polygons(db, parking_lot_id, coordinates)
+        db.commit()
+
+        parking_system.add_parking_lot(parking_lot_id, video_source, coordinates)
+
+        return jsonify({
+            "status": "success",
+            "message": f"주차장 '{parking_lot_id}'가 성공적으로 추가되었습니다",
+            "parking_lot_id": parking_lot_id,
+            "total_spaces": len(coordinates)
+        }), 201
 
     except Exception as e:
         logger.error(f"동적 주차장 추가 중 오류 발생: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(traceback.format_exc())
+        return jsonify({"error": "주차장 추가 중 오류가 발생했습니다"}), 500
+
+
+def parse_coordinates_file(file_ext, content):
+    """좌표 파일 파싱. JSON: {"coordinates": [...]}, TXT/CSV: 'A1,x1,y1,x2,y2,...' 한 줄에 한 주차면"""
+    if file_ext == '.json':
+        data = json.loads(content)
+        if isinstance(data, list):
+            return normalize_spaces(data)
+        return normalize_spaces(data.get('coordinates', data.get('parking_spaces', [])))
+
+    spaces = []
+    for line_no, line in enumerate(content.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = [part.strip() for part in line.split(',')]
+        if len(parts) < 7 or len(parts) % 2 == 0:
+            raise ValueError(f"{line_no}번째 줄: 'ID,x1,y1,x2,y2,x3,y3[,...]' 형식이어야 합니다")
+        try:
+            values = [int(float(v)) for v in parts[1:]]
+        except ValueError:
+            raise ValueError(f"{line_no}번째 줄: 좌표는 숫자여야 합니다")
+        spaces.append({"id": parts[0], "coords": [[values[i], values[i + 1]] for i in range(0, len(values), 2)]})
+    return normalize_spaces(spaces)
 
 
 @app.route('/api/parking_lots/<lot_id>/coordinates', methods=['POST'])
+@require_admin
 def upload_coordinates_file(lot_id):
-    """좌표 파일 업로드 (TXT, JSON 형식 지원)"""
+    """주차면 좌표 파일 업로드 (TXT, CSV, JSON 형식 지원). 업로드한 좌표는 DB에 저장되어 재시작 후에도 유지된다"""
     try:
+        if lot_id not in VIDEO_SOURCES and lot_id not in PARKING_SPACES:
+            return jsonify({"error": f"주차장 '{lot_id}'를 찾을 수 없습니다"}), 404
+
         if 'file' not in request.files:
             return jsonify({"error": "파일이 업로드되지 않았습니다"}), 400
 
@@ -2884,230 +2319,117 @@ def upload_coordinates_file(lot_id):
         if file.filename == '':
             return jsonify({"error": "파일이 선택되지 않았습니다"}), 400
 
-        # 파일 형식 확인
-        allowed_extensions = {'.txt', '.json'}
         file_ext = os.path.splitext(file.filename)[1].lower()
+        if file_ext not in {'.txt', '.csv', '.json'}:
+            return jsonify({"error": "지원되는 파일 형식: .txt, .csv, .json"}), 400
 
-        if file_ext not in allowed_extensions:
-            return jsonify({"error": "지원되는 파일 형식: .txt, .json"}), 400
+        try:
+            coordinates = parse_coordinates_file(file_ext, file.read().decode('utf-8'))
+        except (ValueError, UnicodeDecodeError) as e:
+            return jsonify({"error": f"좌표 파일을 해석할 수 없습니다: {e}"}), 400
 
-        # 파일 내용 읽기
-        content = file.read().decode('utf-8')
-        coordinates = []
-
-        if file_ext == '.json':
-            # JSON 형식 파싱
-            import json
-            data = json.loads(content)
-            coordinates = data.get('coordinates', data.get('parking_spaces', []))
-
-        elif file_ext == '.txt':
-            # TXT 형식 파싱 (간단한 형식 가정)
-            lines = content.strip().split('\n')
-            for line in lines:
-                if line.strip() and not line.startswith('#'):
-                    # 예: A1,74,104,40,200,2,204,3,105
-                    parts = line.split(',')
-                    if len(parts) >= 9:  # ID + 최소 4개 좌표점
-                        space_id = parts[0].strip()
-                        coords = []
-                        for i in range(1, len(parts), 2):
-                            if i + 1 < len(parts):
-                                x = int(parts[i].strip())
-                                y = int(parts[i + 1].strip())
-                                coords.append((x, y))
-                        if len(coords) >= 4:
-                            coordinates.append({"id": space_id, "coords": coords})
-
-        # 좌표 유효성 검증
         if not coordinates:
             return jsonify({"error": "유효한 좌표를 찾을 수 없습니다"}), 400
 
-        # 주차장에 좌표 적용
-        if lot_id in PARKING_SPACES:
-            PARKING_SPACES[lot_id] = coordinates
-            return jsonify({
-                "status": "success",
-                "message": f"주차장 '{lot_id}'의 좌표가 업데이트되었습니다",
-                "total_spaces": len(coordinates)
-            })
-        else:
-            return jsonify({"error": f"주차장 '{lot_id}'를 찾을 수 없습니다"}), 404
-
-    except Exception as e:
-        logger.error(f"좌표 파일 업로드 중 오류 발생: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-# 주차장별 통계 API 개선
-@app.route('/api/statistics/<parking_lot_id>', methods=['GET'])
-def get_parking_lot_statistics(parking_lot_id):
-    """특정 주차장의 통계 정보 반환"""
-    try:
-        # 주차장 존재 확인
-        if parking_lot_id not in PARKING_SPACES:
-            return jsonify({"error": f"주차장 '{parking_lot_id}'를 찾을 수 없습니다"}), 404
-
-        # 영상 연결 여부 확인
-        has_video = parking_lot_id in VIDEO_SOURCES
-
-        if not has_video:
-            # 영상이 없는 주차장에 대한 응답
-            return jsonify({
-                "parking_lot_id": parking_lot_id,
-                "has_video": False,
-                "message": "아직 영상이 연결되지 않은 주차장입니다",
-                "total_spaces": len(PARKING_SPACES.get(parking_lot_id, [])),
-                "current": {
-                    "time": datetime.now().strftime("%H:%M"),
-                    "hour": datetime.now().hour,
-                    "occupancy_rate": 0.0,
-                    "formatted_rate": "0%",
-                    "total_spaces": len(PARKING_SPACES.get(parking_lot_id, [])),
-                    "occupied_spaces": 0,
-                    "available_spaces": len(PARKING_SPACES.get(parking_lot_id, []))
-                },
-                "hourly_data": [],
-                "recommendation": {
-                    "best_hour": 6,
-                    "formatted_time": "06:00",
-                    "occupancy_rate": 0.0,
-                    "formatted_rate": "0%"
-                },
-                "time_periods": {}
-            })
-
-        # 영상이 있는 주차장의 경우 실제 통계 계산
         db = get_db()
-        cursor = db.cursor()
+        save_space_polygons(db, lot_id, coordinates)
+        db.execute("UPDATE parking_lots SET capacity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                   (len(coordinates), lot_id))
+        db.commit()
 
-        # 현재 상태
-        current_status = parking_system.get_parking_status()
-        lot_status = current_status.get(parking_lot_id, {})
-
-        current_time = datetime.now()
-        current_hour = current_time.hour
-
-        # 시간별 점유율 데이터 조회
-        cursor.execute(
-            """
-            SELECT hour, AVG(occupancy_rate) as avg_rate
-            FROM occupancy_rates 
-            WHERE parking_lot = ? AND date(timestamp) = date('now', 'localtime')
-            GROUP BY hour
-            ORDER BY hour
-            """,
-            (parking_lot_id,)
-        )
-
-        hourly_data = {row[0]: row[1] for row in cursor.fetchall()}
-
-        # 통계 생성 로직 (기존과 유사하지만 특정 주차장에 대해서만)
-        # ... (통계 계산 로직은 기존 get_statistics()와 유사)
+        PARKING_SPACES[lot_id] = coordinates
+        parking_system.reset_lot_state(lot_id)
 
         return jsonify({
-            "parking_lot_id": parking_lot_id,
-            "has_video": True,
-            "current": lot_status,
-            "hourly_data": [],  # 실제 데이터로 채우기
-            "recommendation": {},  # 실제 데이터로 채우기
-            "time_periods": {}  # 실제 데이터로 채우기
+            "status": "success",
+            "message": f"주차장 '{lot_id}'의 좌표가 업데이트되었습니다",
+            "total_spaces": len(coordinates)
         })
 
     except Exception as e:
-        logger.error(f"주차장 '{parking_lot_id}' 통계 조회 중 오류: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"좌표 파일 업로드 중 오류 발생: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": "좌표 파일 업로드 중 오류가 발생했습니다"}), 500
+
+
+def _console_exit_requested():
+    """Windows 콘솔에서 'x' 키 입력 확인 (다른 OS에서는 Ctrl+C 사용)"""
+    if os.name != 'nt':
+        return False
+    import msvcrt
+    return msvcrt.kbhit() and msvcrt.getch() == b'x'
 
 
 def main():
-    """메인 함수 (종료 처리 개선)"""
+    """메인 함수"""
+    global ADMIN_TOKEN, parking_system
+
     parser = argparse.ArgumentParser(description='대학교 주차장 관리 시스템')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='호스트 IP')
     parser.add_argument('--port', type=int, default=5000, help='포트 번호')
     parser.add_argument('--debug', action='store_true', help='디버그 모드 활성화')
-    parser.add_argument('--frame-skip', type=int, default=3, help='처리할 프레임 간격')
+    parser.add_argument('--frame-skip', type=int, default=5, help='추론할 프레임 간격 (기본 5: 5프레임 중 1프레임 추론)')
     parser.add_argument('--log-level', type=str, default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         help='로그 레벨 설정')
-    parser.add_argument('--show-video', action='store_true', help='영상 표시 활성화 (기본값 True)')
-    parser.add_argument('--no-video', action='store_true', help='영상 표시 비활성화')
+    parser.add_argument('--show-video', action='store_true', help='영상 표시 활성화 (기본값, 이전 버전 호환용)')
+    parser.add_argument('--no-video', action='store_true', help='영상 표시 비활성화 (서버/헤드리스 환경)')
     args = parser.parse_args()
 
-    # 로그 레벨 설정
-    log_level = getattr(logging, args.log_level)
-    logger.setLevel(log_level)
+    logger.setLevel(getattr(logging, args.log_level))
 
-    # 데이터베이스 초기화
-    with app.app_context():
-        init_db()
+    if args.frame_skip < 1:
+        parser.error('--frame-skip은 1 이상이어야 합니다')
 
-    global parking_system
-    # 영상 표시 옵션 적용 (--no-video 옵션으로 비활성화 가능)
-    show_video = not args.no_video  # 기본적으로 True, --no-video 옵션이 있으면 False
+    if not ADMIN_TOKEN:
+        ADMIN_TOKEN = secrets.token_urlsafe(16)
+        logger.warning(f"ADMIN_TOKEN 환경 변수가 없어 임시 관리자 토큰을 생성했습니다: {ADMIN_TOKEN}")
 
-    # 기존 OpenCV 창 정리
+    # 데이터베이스 초기화 및 설정 로드
+    init_db()
+    setup_video_sources()
+    load_persisted_parking_lots()
+
+    show_video = not args.no_video
+
     try:
-        cv2.destroyAllWindows()
-        time.sleep(0.2)  # 창이 닫히도록 잠시 대기
-    except:
-        pass
+        parking_system = ParkingSystem(show_video=show_video)
+    except (FileNotFoundError, ImportError) as e:
+        logger.error(str(e))
+        sys.exit(1)
 
-    parking_system = ParkingSystem(show_video=show_video)
-
-    # 프레임 스킵 설정
     parking_system.frame_skip = args.frame_skip
 
     logger.info("주차장 관리 시스템 시작 중...")
     logger.info(f"모델 경로: {MODEL_PATH}")
     logger.info(f"비디오 소스: {VIDEO_SOURCES}")
-    logger.info(f"영상 표시: {'활성화' if show_video else '비활성화'}")
+    logger.info(f"영상 표시: {'활성화' if show_video else '비활성화'}, 프레임 간격: {args.frame_skip}")
 
-    # 중요: 항상 시스템 시작
-    logger.info("주차 감지 시스템을 시작합니다...")
     parking_system.start()
 
-    # Flask 앱 실행
-    server_thread = None
+    # Flask는 별도 스레드에서 실행하고, 메인 스레드는 화면 표시(OpenCV GUI)와 종료 신호를 담당
+    server_thread = threading.Thread(
+        target=lambda: app.run(host=args.host, port=args.port, debug=args.debug, threaded=True, use_reloader=False),
+        daemon=True
+    )
+    server_thread.start()
 
     try:
-        # 별도 스레드에서 Flask 실행
-        def run_flask_app():
-            app.run(host=args.host, port=args.port, debug=args.debug,
-                    threaded=True, use_reloader=False)
-
-        server_thread = threading.Thread(target=run_flask_app, daemon=True)
-        server_thread.start()
-
-        # 메인 스레드는 종료 신호 대기
         while parking_system.running:
-            time.sleep(0.5)  # 0.5초마다 상태 확인
+            if parking_system.show_video:
+                parking_system.update_display()
+                time.sleep(0.03)
+            else:
+                time.sleep(0.5)
 
-            # 키 'x'를 눌러 전체 시스템 종료할 수 있도록 추가 (콘솔에서)
-            if msvcrt.kbhit():  # Windows에서만 작동
-                key = msvcrt.getch()
-                if key == b'x':
-                    logger.info("사용자가 콘솔에서 'x' 키를 눌러 종료합니다")
-                    parking_system.running = False
-                    break
-
+            if _console_exit_requested():
+                logger.info("사용자가 콘솔에서 'x' 키를 눌러 종료합니다")
+                break
     except KeyboardInterrupt:
         logger.info("키보드 인터럽트로 프로그램 종료")
     finally:
-        # 종료 처리
         logger.info("프로그램 종료 중...")
-        if hasattr(parking_system, 'cleanup'):
-            parking_system.cleanup()
-        else:
-            if hasattr(parking_system, 'stop'):
-                parking_system.stop()
-
-        # 모든 OpenCV 창 닫기 시도
-        try:
-            cv2.destroyAllWindows()
-            time.sleep(0.2)  # 창이 완전히 닫히도록 대기
-        except:
-            pass
-
+        parking_system.cleanup()
         logger.info("시스템 정리 완료")
 
 

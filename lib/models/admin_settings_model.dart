@@ -1,3 +1,5 @@
+import '../config/app_config.dart';
+
 // 관리자 설정 모델
 class AdminSettings {
   final String apiUrl;
@@ -15,9 +17,9 @@ class AdminSettings {
   // 기본 설정으로 생성
   factory AdminSettings.defaultSettings() {
     return AdminSettings(
-      apiUrl: 'http://localhost:5000',
-      modelPath: 'C:\\Users\\user\\Desktop\\Flutter\\server\\models\\best_seo.pt',
-      videoPath: 'C:\\Users\\user\\Desktop\\Flutter\\parking_best.mp4',
+      apiUrl: AppConfig.baseUrl,
+      modelPath: 'models/best.pt',
+      videoPath: 'videos/library2.mp4',
       lastUpdated: DateTime.now(),
     );
   }
@@ -25,7 +27,7 @@ class AdminSettings {
   // JSON에서 생성
   factory AdminSettings.fromJson(Map<String, dynamic> json) {
     return AdminSettings(
-      apiUrl: json['apiUrl'] ?? 'http://localhost:5000',
+      apiUrl: json['apiUrl'] ?? AppConfig.baseUrl,
       modelPath: json['modelPath'] ?? '',
       videoPath: json['videoPath'] ?? '',
       lastUpdated: json['lastUpdated'] != null

@@ -231,7 +231,7 @@ class ParkingLotView extends StatelessWidget {
                         const SizedBox(width: 4),
                         const Expanded(
                           child: Text(
-                            '장애인 전용 2구역 (D6, D7)',
+                            '장애인 전용 1구역 (D6)',
                             style: TextStyle(fontSize: 12),
                             overflow: TextOverflow.ellipsis,
                           ),
@@ -281,8 +281,6 @@ class ParkingLotView extends StatelessWidget {
       bSpaces: spacesBySection['B'] ?? [],
       cSpaces: spacesBySection['C'] ?? [],
       dSpaces: spacesBySection['D'] ?? [],
-      videoWidth: videoWidth,
-      videoHeight: videoHeight,
     );
   }
 
@@ -466,22 +464,25 @@ class ParkingLotView extends StatelessWidget {
 }
 
 // 통합된 직사각형 주차장 페인터
+// 구역(A~D)마다 한 줄씩, 주차면 번호 순서대로 칸을 배치해 캔버스 크기에 맞게 그린다.
 class RectangularParkingPainter extends CustomPainter {
   final List<ParkingSpace> aSpaces;
   final List<ParkingSpace> bSpaces;
   final List<ParkingSpace> cSpaces;
   final List<ParkingSpace> dSpaces;
-  final int videoWidth;
-  final int videoHeight;
 
   RectangularParkingPainter({
     required this.aSpaces,
     required this.bSpaces,
     this.cSpaces = const [],
     this.dSpaces = const [],
-    required this.videoWidth,
-    required this.videoHeight,
   });
+
+  // 'D4electric', 'B2disabled', 'A10' 등에서 번호 추출
+  static int spaceIndex(String id) {
+    final match = RegExp(r'^[A-Za-z](\d+)').firstMatch(id);
+    return match != null ? int.parse(match.group(1)!) : 0;
+  }
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -489,27 +490,32 @@ class RectangularParkingPainter extends CustomPainter {
     final backgroundPaint = Paint()..color = Colors.grey.shade200;
     canvas.drawRect(Rect.fromLTWH(0, 0, size.width, size.height), backgroundPaint);
 
-    // 크기 조정
-    final scaleX = size.width / videoWidth;
-    final scaleY = size.height / videoHeight;
+    final rows = [aSpaces, bSpaces, cSpaces, dSpaces].where((spaces) => spaces.isNotEmpty).toList();
+    if (rows.isEmpty) return;
 
-    // 각 구역 그리기
-    _drawParkingSection(canvas, aSpaces, scaleX, scaleY);
-    _drawParkingSection(canvas, bSpaces, scaleX, scaleY);
-    _drawParkingSection(canvas, cSpaces, scaleX, scaleY);
-    _drawParkingSection(canvas, dSpaces, scaleX, scaleY);
+    final rowHeight = size.height / rows.length;
+    for (int row = 0; row < rows.length; row++) {
+      _drawParkingSection(canvas, rows[row], size.width, row * rowHeight, rowHeight);
+    }
   }
 
   void _drawParkingSection(
     Canvas canvas,
     List<ParkingSpace> spaces,
-    double scaleX,
-    double scaleY,
+    double width,
+    double top,
+    double rowHeight,
   ) {
-    for (var space in spaces) {
+    // 칸 수: 가장 큰 번호 기준 (번호가 빠진 칸은 빈 자리로 남김)
+    final maxIndex = spaces.map((space) => spaceIndex(space.id)).fold<int>(0, (a, b) => a > b ? a : b);
+    final columns = maxIndex > 0 ? maxIndex : spaces.length;
+    final columnWidth = width / columns;
+
+    for (int i = 0; i < spaces.length; i++) {
+      final space = spaces[i];
       final bool isOccupied = space.isOccupied;
       final bool isElectric = space.id.toLowerCase().contains('electric');
-      final bool isDisabled = space.id.toLowerCase().contains('disabled') || space.isDisabledSpace;
+      final bool isDisabled = space.isDisabledSpace;
 
       // 주차 공간 색상
       Color fillColor;
@@ -530,88 +536,21 @@ class RectangularParkingPainter extends CustomPainter {
         ..style = PaintingStyle.stroke
         ..strokeWidth = 2;
 
-      // 공간 좌표 계산
-      final rect = _getRectForSpace(space.id, scaleX, scaleY);
+      final index = spaceIndex(space.id);
+      final column = index > 0 ? index - 1 : i;
+      final rect = Rect.fromLTWH(
+        column * columnWidth + columnWidth * 0.05,
+        top + rowHeight * 0.1,
+        columnWidth * 0.9,
+        rowHeight * 0.8,
+      );
 
-      if (rect != null) {
-        canvas.drawRect(rect, fillPaint);
-        canvas.drawRect(rect, strokePaint);
+      canvas.drawRect(rect, fillPaint);
+      canvas.drawRect(rect, strokePaint);
 
-        // 주차 공간 ID 표시
-        _drawParkingId(canvas, space.id, rect, isElectric, isDisabled);
-      }
+      // 주차 공간 ID 표시
+      _drawParkingId(canvas, space.id, rect, isElectric, isDisabled);
     }
-  }
-
-  Rect? _getRectForSpace(String id, double scaleX, double scaleY) {
-    // 특수 ID 처리 (disabled, electric 포함)
-    if (id.toLowerCase().contains('disabled') || id.toLowerCase().contains('electric')) {
-      final RegExp regExp = RegExp(r'([A-Za-z])(\d+)');
-      final match = regExp.firstMatch(id);
-
-      if (match != null && match.groupCount >= 1) {
-        final String section = id[0];
-        final int index = int.tryParse(match.group(1) ?? '0') ?? 0;
-
-        return _getRectBySectionAndIndex(section, index, scaleX, scaleY);
-      }
-    }
-
-    // 일반 ID 처리
-    if (id.length > 1) {
-      final String section = id[0];
-      final int index = int.tryParse(id.substring(1)) ?? 0;
-
-      return _getRectBySectionAndIndex(section, index, scaleX, scaleY);
-    }
-
-    return null;
-  }
-
-  Rect? _getRectBySectionAndIndex(String section, int index, double scaleX, double scaleY) {
-    switch (section.toUpperCase()) {
-      case 'A':
-        if (index > 0 && index <= 12) {
-          double width = (videoWidth / 12) * 0.9;
-          double height = 150;
-          double left = ((index - 1) * (videoWidth / 12)) * scaleX;
-          double top = 80 * scaleY;
-          return Rect.fromLTWH(left, top, width * scaleX, height * scaleY);
-        }
-        break;
-
-      case 'B':
-        if (index > 0 && index <= 10) {
-          double width = (videoWidth / 10) * 0.9;
-          double height = 150;
-          double left = ((index - 1) * (videoWidth / 10)) * scaleX;
-          double top = 280 * scaleY;
-          return Rect.fromLTWH(left, top, width * scaleX, height * scaleY);
-        }
-        break;
-
-      case 'C':
-        if (index > 0 && index <= 8) {
-          double width = (videoWidth / 8) * 0.9;
-          double height = 150;
-          double left = ((index - 1) * (videoWidth / 8)) * scaleX;
-          double top = 480 * scaleY;
-          return Rect.fromLTWH(left, top, width * scaleX, height * scaleY);
-        }
-        break;
-
-      case 'D':
-        if (index > 0 && index <= 7) {
-          double width = (videoWidth / 7) * 0.9;
-          double height = 120;
-          double left = ((index - 1) * (videoWidth / 7)) * scaleX;
-          double top = 680 * scaleY;
-          return Rect.fromLTWH(left, top, width * scaleX, height * scaleY);
-        }
-        break;
-    }
-
-    return null;
   }
 
   void _drawParkingId(Canvas canvas, String id, Rect rect, bool isElectric, bool isDisabled) {
@@ -686,34 +625,6 @@ class RectangularParkingPainter extends CustomPainter {
         position.dy - textPainter.height / 2,
       ),
     );
-  }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
-}
-
-      // ID 표시
-      final textPainter = TextPainter(
-        text: TextSpan(
-          text: space.id,
-          style: const TextStyle(
-            color: Colors.white,
-            fontSize: 14,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-        textDirection: TextDirection.ltr,
-      );
-
-      textPainter.layout();
-      textPainter.paint(
-        canvas,
-        Offset(
-          rect.center.dx - textPainter.width / 2,
-          rect.center.dy - textPainter.height / 2,
-        ),
-      );
-    }
   }
 
   @override

@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../config/app_config.dart';
 import '../models/admin_settings_model.dart';
 
 class AdminSettingsService {
@@ -23,6 +24,22 @@ class AdminSettingsService {
       // 오류 발생 시 기본 설정 반환
       print('설정을 가져오는 중 오류 발생: $e');
       return AdminSettings.defaultSettings();
+    }
+  }
+
+  // 저장된 서버 주소가 있으면 앱 설정에 반영 (앱 시작 시 호출)
+  Future<void> applySavedApiUrl() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final settingsJson = prefs.getString(_settingsKey);
+      if (settingsJson == null) return;
+
+      final apiUrl = AdminSettings.fromJson(json.decode(settingsJson)).apiUrl;
+      if (apiUrl.isNotEmpty) {
+        AppConfig.baseUrl = apiUrl;
+      }
+    } catch (e) {
+      print('저장된 서버 주소를 불러오는 중 오류 발생: $e');
     }
   }
 

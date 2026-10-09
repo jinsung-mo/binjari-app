@@ -3,10 +3,14 @@ import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'dart:io' show Platform;
 import 'config/app_config.dart';
+import 'services/admin_settings_service.dart';
 import 'screens/campus_map_screen.dart'; // Changed to map screen
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // 관리자 화면에서 저장한 서버 주소 적용
+  await AdminSettingsService().applySavedApiUrl();
 
   // Platform verification
   if (!kIsWeb) {

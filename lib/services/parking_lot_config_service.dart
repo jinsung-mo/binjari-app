@@ -137,7 +137,7 @@ class ParkingLotConfigService {
 
       final response = await http.post(
         Uri.parse(apiUrl),
-        headers: {'Content-Type': 'application/json'},
+        headers: AppConfig.jsonHeaders,
         body: jsonEncode(config.toJson()),
       ).timeout(Duration(seconds: AppConfig.connectionTimeout));
 
@@ -155,7 +155,7 @@ class ParkingLotConfigService {
 
       final response = await http.delete(
         Uri.parse(apiUrl),
-        headers: {'Content-Type': 'application/json'},
+        headers: AppConfig.jsonHeaders,
       ).timeout(Duration(seconds: AppConfig.connectionTimeout));
 
       return response.statusCode >= 200 && response.statusCode < 300;

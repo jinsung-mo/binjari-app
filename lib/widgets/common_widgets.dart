@@ -2,7 +2,6 @@
 // 재사용 가능한 공통 위젯
 
 import 'package:flutter/material.dart';
-import '../config/app_config.dart';
 
 // 정보 카드 위젯 (주차 가능 수, 점유율 등)
 class InfoCard extends StatelessWidget {
